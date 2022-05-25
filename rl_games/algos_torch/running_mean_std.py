@@ -1,4 +1,5 @@
-from rl_games.algos_torch import torch_ext
+
+
 import torch
 import torch.nn as nn
 import numpy as np
@@ -21,7 +22,7 @@ class RunningMeanStd(nn.Module):
                 self.axis = [0,2]
             if len(self.insize) == 1:
                 self.axis = [0]
-            in_size = self.insize[0] 
+            in_size = self.insize[0]
         else:
             self.axis = [0]
             in_size = insize
@@ -42,14 +43,11 @@ class RunningMeanStd(nn.Module):
         new_count = tot_count
         return new_mean, new_var, new_count
 
-    def forward(self, input, unnorm=False, mask=None):
+    def forward(self, input, unnorm=False):
         if self.training:
-            if mask is not None:
-                mean, var = torch_ext.get_mean_std_with_masks(input, mask)
-            else:
-                mean = input.mean(self.axis) # along channel axis
-                var = input.var(self.axis)
-            self.running_mean, self.running_var, self.count = self._update_mean_var_count_from_moments(self.running_mean, self.running_var, self.count, 
+            mean = input.mean(self.axis) # along channel axis
+            var = input.var(self.axis)
+            self.running_mean, self.running_var, self.count = self._update_mean_var_count_from_moments(self.running_mean, self.running_var, self.count,
                                                     mean, var, input.size()[0] )
 
         # change shape
@@ -62,7 +60,7 @@ class RunningMeanStd(nn.Module):
                 current_var = self.running_var.view([1, self.insize[0], 1]).expand_as(input)
             if len(self.insize) == 1:
                 current_mean = self.running_mean.view([1, self.insize[0]]).expand_as(input)
-                current_var = self.running_var.view([1, self.insize[0]]).expand_as(input)        
+                current_var = self.running_var.view([1, self.insize[0]]).expand_as(input)
         else:
             current_mean = self.running_mean
             current_var = self.running_var
@@ -82,12 +80,12 @@ class RunningMeanStd(nn.Module):
 
 class RunningMeanStdObs(nn.Module):
     def __init__(self, insize, epsilon=1e-05, per_channel=False, norm_only=False):
-        assert(isinstance(insize, dict))
+        assert(insize is dict)
         super(RunningMeanStdObs, self).__init__()
         self.running_mean_std = nn.ModuleDict({
             k : RunningMeanStd(v, epsilon, per_channel, norm_only) for k,v in insize.items()
         })
-    
+
     def forward(self, input, unnorm=False):
-        res = {k : self.running_mean_std[k](v, unnorm) for k,v in input.items()}
+        res = {k : self.running_mean_std(v, unnorm) for k,v in input.items()}
         return res

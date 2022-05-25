@@ -5,6 +5,9 @@ params:
   model:
     name: discrete_a2c
 
+  load_checkpoint: False
+  load_path: 'nn/sc2smac_cnn'
+
   network:
     name: actor_critic
     separate: True
@@ -57,12 +60,12 @@ params:
     e_clip: 0.2
     clip_value: True
     num_actors: 8
-    horizon_length: 64
+    steps_num: 64
     minibatch_size: 2560
     mini_epochs: 1
     critic_coef: 2
     lr_schedule:  None
-    kl_threshold: 0.05
+    lr_threshold: 0.05
     normalize_input: False
     use_action_masks: True
 

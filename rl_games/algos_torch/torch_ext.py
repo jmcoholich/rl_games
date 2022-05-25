@@ -4,8 +4,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.optim.optimizer import Optimizer
-import math
-import time
 
 numpy_to_torch_dtype_dict = {
     np.dtype('bool')       : torch.bool,
@@ -15,9 +13,8 @@ numpy_to_torch_dtype_dict = {
     np.dtype('int32')      : torch.int32,
     np.dtype('int64')      : torch.int64,
     np.dtype('float16')    : torch.float16,
-    np.dtype('float64')    : torch.float32,
     np.dtype('float32')    : torch.float32,
-    #np.dtype('float64')    : torch.float64,
+    np.dtype('float64')    : torch.float64,
     np.dtype('complex64')  : torch.complex64,
     np.dtype('complex128') : torch.complex128,
 }
@@ -39,48 +36,52 @@ def mean_mask(input, mask, sum_mask):
     return (input * rnn_masks).sum() / sum_mask
 
 def shape_whc_to_cwh(shape):
+    #if len(shape) == 2:
+    #    return (shape[1], shape[0])
     if len(shape) == 3:
         return (shape[2], shape[0], shape[1])
-    
-    return shape
-
-
-def shape_cwh_to_whc(shape):
-    if len(shape) == 3:
-        return (shape[1], shape[2], shape[0])
 
     return shape
 
-def safe_filesystem_op(func, *args, **kwargs):
-    """
-    This is to prevent spurious crashes related to saving checkpoints or restoring from checkpoints in a Network
-    Filesystem environment (i.e. NGC cloud or SLURM)
-    """
-    num_attempts = 5
-    for attempt in range(num_attempts):
-        try:
-            return func(*args, **kwargs)
-        except Exception as exc:
-            print(f'Exception {exc} when trying to execute {func} with args:{args} and kwargs:{kwargs}...')
-            wait_sec = 2 ** attempt
-            print(f'Waiting {wait_sec} before trying again...')
-            time.sleep(wait_sec)
-
-    raise RuntimeError(f'Could not execute {func}, give up after {num_attempts} attempts...')
-
-def safe_save(state, filename):
-    return safe_filesystem_op(torch.save, state, filename)
-
-def safe_load(filename):
-    return safe_filesystem_op(torch.load, filename)
-
-def save_checkpoint(filename, state):
+def save_scheckpoint(filename, state):
     print("=> saving checkpoint '{}'".format(filename + '.pth'))
-    safe_save(state, filename + '.pth')
 
-def load_checkpoint(filename):
-    print("=> loading checkpoint '{}'".format(filename))
-    state = safe_load(filename)
+    torch.save(state, filename + '.pth')
+
+def load_checkpoint(filename, ws):
+    import os
+    if ws == -1:
+        print("=> loading checkpoint '{}'".format(filename))
+        path = os.path.join('./nn', filename, 'Aliengo.pth')
+        state = torch.load(path, map_location='cuda:0')
+    else:
+        print("=> loading checkpoint '{}' from workstation {}".format(filename,
+                                                                      ws))
+        import paramiko
+        ssh_client = paramiko.SSHClient()
+        ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ws_ip = ['143.215.128.18',
+                 '143.215.131.33',
+                 '143.215.131.34',
+                 '143.215.128.16',
+                 '143.215.131.25',
+                 '143.215.131.23',
+                 '130.207.124.148',  # skynet head node
+                 '143.215.128.197',  # my personal lab desktop
+                 ]
+        print('\n\nOpening Remote SSH Client...\n\n')
+        if ws != 7:
+            ssh_client.connect(ws_ip[ws - 1], 22, 'jcoholich')
+        else:
+            ssh_client.connect(ws_ip[ws - 1], 22, 'jcoholich3')
+        print('Connected!\n\n')
+        # ssh_client.exec_command('cd hutter_kostrikov; cd trained_models')
+        sftp_client = ssh_client.open_sftp()
+        path = os.path.join('isaacgym/python/rlgpu/nn', filename, 'Aliengo.pth')
+        remote_file = sftp_client.open(path, 'rb')
+        state = torch.load(remote_file, map_location='cuda:0')
+    print('Agent Loaded\n\n')
+
     return state
 
 def parameterized_truncated_normal(uniform, mu, sigma, a, b):
@@ -136,58 +137,19 @@ def apply_masks(losses, mask=None):
         res_losses = [(l * mask).sum() / sum_mask for l in losses]
     else:
         res_losses = [torch.mean(l) for l in losses]
-    
+
     return res_losses, sum_mask
 
 def normalization_with_masks(values, masks):
-    if masks is None:
-        return (values - values.mean()) / (values.std() + 1e-8)
-
-    values_mean, values_var = get_mean_var_with_masks(values, masks)
-    values_std = torch.sqrt(values_var)
-    normalized_values = (values - values_mean) / (values_std + 1e-8)
-
-    return normalized_values
-
-def get_mean_var_with_masks(values, masks):
     sum_mask = masks.sum()
     values_mask = values * masks
     values_mean = values_mask.sum() / sum_mask
     min_sqr = ((((values_mask)**2)/sum_mask).sum() - ((values_mask/sum_mask).sum())**2)
-    values_var = min_sqr * sum_mask / (sum_mask-1)
-    return values_mean, values_var
+    values_std = torch.sqrt(min_sqr * sum_mask / (sum_mask-1))
+    normalized_values = (values_mask - values_mean) / (values_std + 1e-8)
 
-def explained_variance(y_pred,y, masks=None):
-    """
-    Computes fraction of variance that ypred explains about y.
-    Returns 1 - Var[y-ypred] / Var[y]
-    interpretation:
-        ev=0  =>  might as well have predicted zero
-        ev=1  =>  perfect prediction
-        ev<0  =>  worse than just predicting zero
-    """
+    return normalized_values
 
-    if masks is not None:
-        masks = masks.unsqueeze(1)
-        _, var_y = get_mean_var_with_masks(y_pred,masks)
-        _, var_dy = get_mean_var_with_masks(y-y_pred, masks)
-    else:
-        var_y = torch.var(y)
-        var_dy = torch.var(y-y_pred)
-    return 1.0 - var_dy/var_y
-
-def policy_clip_fraction(new_neglogp, old_neglogp, clip_param, masks=None):
-    logratio = old_neglogp - new_neglogp
-    clip_frac = torch.logical_or(
-                logratio < math.log(1.0 - clip_param),
-                logratio > math.log(1.0 + clip_param),
-            ).float()
-    if masks is not None:
-        clip_frac = clip_frac * masks/masks.sum()
-    else:
-        clip_frac = clip_frac.mean()
-    return clip_frac
-    
 class CoordConv2d(nn.Conv2d):
     pool = {}
     def __init__(self, in_channels, out_channels, kernel_size, stride=1,
@@ -252,7 +214,7 @@ class DiscreteActionsEncoder(nn.Module):
             self.embedding = torch.nn.Embedding(actions_max, emb_size)
         else:
             self.emb_size = actions_max
-        
+
         self.linear = torch.nn.Linear(self.emb_size * num_agents, mlp_out)
 
     def forward(self, discrete_actions):
@@ -287,7 +249,7 @@ class CategoricalMaskedNaive(torch.distributions.Categorical):
             inf_mask = torch.log(masks.float())
             logits = logits + inf_mask
             super(CategoricalMasked, self).__init__(probs, logits, validate_args)
-    
+
     def entropy(self):
         if self.masks is None:
             return super(CategoricalMasked, self).entropy()
@@ -305,7 +267,7 @@ class CategoricalMasked(torch.distributions.Categorical):
             self.device = self.masks.device
             logits = torch.where(self.masks, logits, torch.tensor(-1e+8).to(self.device))
             super(CategoricalMasked, self).__init__(probs, logits, validate_args)
-    
+
     def rsample(self):
         u = torch.distributions.Uniform(low=torch.zeros_like(self.logits, device = self.logits.device), high=torch.ones_like(self.logits, device = self.logits.device)).sample()
         #print(u.size(), self.logits.size())
@@ -347,6 +309,52 @@ class AverageMeter(nn.Module):
     def get_mean(self):
         return self.mean.squeeze(0).cpu().numpy()
 
+# class AverageMeter(nn.Module):
+#     def __init__(self, in_shape, max_size):
+#         assert in_shape == 1
+#         super(AverageMeter, self).__init__()
+#         self.max_size = max_size
+#         self.current_size = 0
+#         self.register_buffer("mean", torch.zeros(in_shape, dtype = torch.float32))
+#         self.register_buffer("samples", torch.zeros(max_size, dtype = torch.float32))
+#         self.values_idx = 0
+
+#     def update(self, values):
+#         size = values.size()[0]
+#         if size == 0:
+#             return
+#         # keep rolling buffer of values for computing variance
+#         # end_idx = np.clip(self.values_idx + size, -100000, self.max_size)
+#         # self.samples[self.values_idx: end_idx] = values[:end_idx - self.values_idx].view(np.clip(size, -1000, self.max_size))
+#         # self.values_idx = end_idx % self.max_size
+#         if size >= self.max_size:
+#             self.samples[:] = values[0: self.max_size].view(self.max_size)
+#         else:
+#             keep_size = self.max_size - size
+#             temp = self.samples.clone()
+#             self.samples[-keep_size:] = temp[:keep_size]
+#             self.samples[:size] = values.view(size)
+
+#         new_mean = torch.mean(values.float(), dim=0)
+#         size = np.clip(size, 0, self.max_size)
+#         old_size = min(self.max_size - size, self.current_size)
+#         size_sum = old_size + size
+#         self.current_size = size_sum
+#         self.mean = (self.mean * old_size + new_mean * size) / size_sum
+
+    def clear(self):
+        self.current_size = 0
+        self.mean.fill_(0)
+
+    def __len__(self):
+        return self.current_size
+
+    def get_mean(self):
+        return self.mean.squeeze(0).cpu().numpy()
+
+    def get_var(self):
+        return self.samples.var().cpu().numpy().item()
+
 
 class IdentityRNN(nn.Module):
     def __init__(self, in_shape, out_shape):
@@ -357,4 +365,4 @@ class IdentityRNN(nn.Module):
     def forward(self, x, h):
         return self.identity(x), h
 
- 
+

@@ -2,52 +2,71 @@ from rl_games.common.player import BasePlayer
 from rl_games.algos_torch import torch_ext
 from rl_games.algos_torch.running_mean_std import RunningMeanStd
 from rl_games.common.tr_helpers import unsqueeze_obs
+from rl_games.algos_torch import value_function_utils
 import gym
-import torch 
+import torch
 from torch import nn
 import numpy as np
+import time
+import seaborn as sns
+
+import matplotlib.pyplot as plt
+
 
 
 def rescale_actions(low, high, action):
     d = (high - low) / 2.0
     m = (high + low) / 2.0
-    scaled_action =  action * d + m
+    scaled_action = action * d + m
     return scaled_action
 
 
 class PpoPlayerContinuous(BasePlayer):
-    def __init__(self, params):
-        BasePlayer.__init__(self, params)
-        self.network = self.config['network']
-        self.actions_num = self.action_space.shape[0] 
+    def __init__(self, config):
+        BasePlayer.__init__(self, config)
+        self.network = config['network']
+        self.actions_num = self.action_space.shape[0]
         self.actions_low = torch.from_numpy(self.action_space.low.copy()).float().to(self.device)
         self.actions_high = torch.from_numpy(self.action_space.high.copy()).float().to(self.device)
         self.mask = [False]
 
         self.normalize_input = self.config['normalize_input']
-        self.normalize_value = self.config.get('normalize_value', False)
-
         obs_shape = self.obs_shape
         config = {
             'actions_num' : self.actions_num,
             'input_shape' : obs_shape,
-            'num_seqs' : self.num_agents,
-            'value_size': self.env_info.get('value_size',1),
-            'normalize_value': self.normalize_value,
-            'normalize_input': self.normalize_input,
-        } 
+            'num_seqs' : self.num_agents
+        }
         self.model = self.network.build(config)
         self.model.to(self.device)
         self.model.eval()
         self.is_rnn = self.model.is_rnn()
+        if self.normalize_input:
+            self.running_mean_std = RunningMeanStd(obs_shape).to(self.device)
+            self.value_mean_std = RunningMeanStd((1,)).to(self.device)
+            self.value_mean_std.eval()
+            self.running_mean_std.eval()
 
-    def get_action(self, obs, is_determenistic = False):
-        if self.has_batch_dimension == False:
+        if self.config['plot_values']:
+            self.value_processor = value_function_utils.ValueProcesser(
+                self,
+                des_dir=self.config['des_dir'],
+                des_dir_coef=self.config['des_dir_coef'],
+                start_after_n_steps=self.config['start_after'],
+                file_prefix=self.config['file_prefix'],
+                grid_points=self.config["grid_points"],
+                box_len=self.config["box_len"],
+                random_footsteps=self.config["random_footsteps"])
+
+    def get_action(self, obs, is_determenistic=False):
+        if self.config['plot_values']:
+            obs = self.value_processor(obs.clone())
+        if not self.has_batch_dimension:
             obs = unsqueeze_obs(obs)
         obs = self._preproc_obs(obs)
         input_dict = {
             'is_train': False,
-            'prev_actions': None, 
+            'prev_actions': None,
             'obs' : obs,
             'rnn_states' : self.states
         }
@@ -60,28 +79,24 @@ class PpoPlayerContinuous(BasePlayer):
             current_action = mu
         else:
             current_action = action
-        if self.has_batch_dimension == False:
-            current_action = torch.squeeze(current_action.detach())
+        current_action = torch.squeeze(current_action.detach())
+        return  rescale_actions(self.actions_low, self.actions_high, torch.clamp(current_action, -1.0, 1.0))
 
-        if self.clip_actions:
-            return rescale_actions(self.actions_low, self.actions_high, torch.clamp(current_action, -1.0, 1.0))
-        else:
-            return current_action
-
-    def restore(self, fn):
-        checkpoint = torch_ext.load_checkpoint(fn)
+    def restore(self, fn, ws):
+        checkpoint = torch_ext.load_checkpoint(fn, ws)
         self.model.load_state_dict(checkpoint['model'])
-        if self.normalize_input and 'running_mean_std' in checkpoint:
-            self.model.running_mean_std.load_state_dict(checkpoint['running_mean_std'])
+        if self.normalize_input:
+            self.running_mean_std.load_state_dict(checkpoint['running_mean_std'])
+            self.value_mean_std.load_state_dict(checkpoint['reward_mean_std'])
 
     def reset(self):
         self.init_rnn()
 
 class PpoPlayerDiscrete(BasePlayer):
-    def __init__(self, params):
-        BasePlayer.__init__(self, params)
+    def __init__(self, config):
+        BasePlayer.__init__(self, config)
 
-        self.network = self.config['network']
+        self.network = config['network']
         if type(self.action_space) is gym.spaces.Discrete:
             self.actions_num = self.action_space.n
             self.is_multi_discrete = False
@@ -89,31 +104,33 @@ class PpoPlayerDiscrete(BasePlayer):
             self.actions_num = [action.n for action in self.action_space]
             self.is_multi_discrete = True
         self.mask = [False]
+
         self.normalize_input = self.config['normalize_input']
-        self.normalize_value = self.config.get('normalize_value', False)
+
         obs_shape = self.obs_shape
         config = {
             'actions_num' : self.actions_num,
             'input_shape' : obs_shape,
             'num_seqs' : self.num_agents,
-            'value_size': self.env_info.get('value_size',1),
-            'normalize_value': self.normalize_value,
-            'normalize_input': self.normalize_input,
+            'value_size': self.value_size
         }
 
         self.model = self.network.build(config)
         self.model.to(self.device)
         self.model.eval()
         self.is_rnn = self.model.is_rnn()
+        if self.normalize_input:
+            self.running_mean_std = RunningMeanStd(obs_shape).to(self.device)
+            self.running_mean_std.eval()
 
     def get_masked_action(self, obs, action_masks, is_determenistic = True):
         if self.has_batch_dimension == False:
             obs = unsqueeze_obs(obs)
         obs = self._preproc_obs(obs)
-        action_masks = torch.Tensor(action_masks).to(self.device).bool()
+        action_masks = torch.Tensor(action_masks).to(self.device)
         input_dict = {
             'is_train': False,
-            'prev_actions': None, 
+            'prev_actions': None,
             'obs' : obs,
             'action_masks' : action_masks,
             'rnn_states' : self.states
@@ -121,7 +138,7 @@ class PpoPlayerDiscrete(BasePlayer):
         self.model.eval()
 
         with torch.no_grad():
-            res_dict = self.model(input_dict)
+            neglogp, value, action, logits, self.states = self.model(input_dict)
         logits = res_dict['logits']
         action = res_dict['actions']
         self.states = res_dict['rnn_states']
@@ -129,12 +146,12 @@ class PpoPlayerDiscrete(BasePlayer):
             if is_determenistic:
                 action = [torch.argmax(logit.detach(), axis=-1).squeeze() for logit in logits]
                 return torch.stack(action,dim=-1)
-            else:    
+            else:
                 return action.squeeze().detach()
         else:
             if is_determenistic:
                 return torch.argmax(logits.detach(), axis=-1).squeeze()
-            else:    
+            else:
                 return action.squeeze().detach()
 
     def get_action(self, obs, is_determenistic = False):
@@ -144,7 +161,7 @@ class PpoPlayerDiscrete(BasePlayer):
         self.model.eval()
         input_dict = {
             'is_train': False,
-            'prev_actions': None, 
+            'prev_actions': None,
             'obs' : obs,
             'rnn_states' : self.states
         }
@@ -157,67 +174,19 @@ class PpoPlayerDiscrete(BasePlayer):
             if is_determenistic:
                 action = [torch.argmax(logit.detach(), axis=1).squeeze() for logit in logits]
                 return torch.stack(action,dim=-1)
-            else:    
+            else:
                 return action.squeeze().detach()
         else:
             if is_determenistic:
                 return torch.argmax(logits.detach(), axis=-1).squeeze()
-            else:    
+            else:
                 return action.squeeze().detach()
 
     def restore(self, fn):
         checkpoint = torch_ext.load_checkpoint(fn)
         self.model.load_state_dict(checkpoint['model'])
-        if self.normalize_input and 'running_mean_std' in checkpoint:
-            self.model.running_mean_std.load_state_dict(checkpoint['running_mean_std'])
+        if self.normalize_input:
+            self.running_mean_std.load_state_dict(checkpoint['running_mean_std'])
 
     def reset(self):
         self.init_rnn()
-
-
-class SACPlayer(BasePlayer):
-    def __init__(self, params):
-        BasePlayer.__init__(self, params)
-        self.network = self.config['network']
-        self.actions_num = self.action_space.shape[0] 
-        self.action_range = [
-            float(self.env_info['action_space'].low.min()),
-            float(self.env_info['action_space'].high.max())
-        ]
-
-        obs_shape = self.obs_shape
-        self.normalize_input = False
-        config = {
-            'obs_dim': self.env_info["observation_space"].shape[0],
-            'action_dim': self.env_info["action_space"].shape[0],
-            'actions_num' : self.actions_num,
-            'input_shape' : obs_shape,
-            'value_size': self.env_info.get('value_size', 1),
-            'normalize_value': False,
-            'normalize_input': self.normalize_input,
-        }  
-        self.model = self.network.build(config)
-        self.model.to(self.device)
-        self.model.eval()
-        self.is_rnn = self.model.is_rnn()
-
-    def restore(self, fn):
-        checkpoint = torch_ext.load_checkpoint(fn)
-        self.model.sac_network.actor.load_state_dict(checkpoint['actor'])
-        self.model.sac_network.critic.load_state_dict(checkpoint['critic'])
-        self.model.sac_network.critic_target.load_state_dict(checkpoint['critic_target'])
-        if self.normalize_input and 'running_mean_std' in checkpoint:
-            self.model.running_mean_std.load_state_dict(checkpoint['running_mean_std'])
-
-    def get_action(self, obs, is_determenistic=False):
-        if self.has_batch_dimension == False:
-            obs = unsqueeze_obs(obs)
-        dist = self.model.actor(obs)
-        actions = dist.sample() if is_determenistic else dist.mean
-        actions = actions.clamp(*self.action_range).to(self.device)
-        if self.has_batch_dimension == False:
-            actions = torch.squeeze(actions.detach())
-        return actions
-
-    def reset(self):
-        pass

@@ -4,28 +4,14 @@ from rl_games.common.env_configurations import configurations
 from rl_games.common.tr_helpers import dicts_to_dict_with_arrays
 import numpy as np
 import gym
-import random
+
 from time import sleep
-import torch
+
 
 class RayWorker:
     def __init__(self, config_name, config):
         self.env = configurations[config_name]['env_creator'](**config)
-
-    def _obs_to_fp32(self, obs):
-        if isinstance(obs, dict):
-            for k, v in obs.items():
-                if isinstance(v, dict):
-                    for dk, dv in v.items():
-                        if dv.dtype == np.float64:
-                            v[dk] = dv.astype(np.float32)
-                else:
-                    if v.dtype == np.float64:
-                        obs[k] = v.astype(np.float32)
-        else:
-            if obs.dtype == np.float64:
-                obs = obs.astype(np.float32)
-        return obs
+        #self.obs = self.env.reset()
 
     def step(self, action):
         next_state, reward, is_done, info = self.env.step(action)
@@ -36,24 +22,26 @@ class RayWorker:
             episode_done = is_done.all()
         if episode_done:
             next_state = self.reset()
-        next_state = self._obs_to_fp32(next_state)
+        if isinstance(next_state, dict):
+            for k,v in next_state.items():
+                if isinstance(v, dict):
+                    for dk,dv in v.items():
+                        if dv.dtype == np.float64:
+                            v[dk] = dv.astype(np.float32)
+                else:
+                    if v.dtype == np.float64:
+                        next_state[k] = v.astype(np.float32)
+        else: 
+            if next_state.dtype == np.float64:
+                next_state = next_state.astype(np.float32)
         return next_state, reward, is_done, info
 
-    def seed(self, seed):
-        if hasattr(self.env, 'seed'):
-            torch.manual_seed(seed)
-            torch.cuda.manual_seed_all(seed)
-            np.random.seed(seed)
-            random.seed(seed)
-            self.env.seed(seed)
-            
     def render(self):
         self.env.render()
 
     def reset(self):
-        obs = self.env.reset()
-        obs = self._obs_to_fp32(obs)
-        return obs
+        self.obs = self.env.reset()
+        return self.obs
 
     def get_action_mask(self):
         return self.env.get_action_mask()
@@ -66,12 +54,6 @@ class RayWorker:
 
     def set_weights(self, weights):
         self.env.update_weights(weights)
-
-    def can_concat_infos(self):
-        if hasattr(self.env, 'concat_infos'):
-            return self.env.concat_infos
-        else:
-            return False
 
     def get_env_info(self):
         info = {}
@@ -92,6 +74,7 @@ class RayWorker:
             info['value_size'] = self.env.value_size
         if hasattr(self.env, 'state_space'):
             info['state_space'] = self.env.state_space
+
         return info
 
 
@@ -100,26 +83,18 @@ class RayVecEnv(IVecEnv):
         self.config_name = config_name
         self.num_actors = num_actors
         self.use_torch = False
-        self.seed = kwargs.pop('seed', None)
+        
         self.remote_worker = ray.remote(RayWorker)
         self.workers = [self.remote_worker.remote(self.config_name, kwargs) for i in range(self.num_actors)]
-
-        if self.seed is not None:
-            seeds = range(self.seed, self.seed + self.num_actors)
-            seed_set = []
-            for (seed, worker) in zip(seeds, self.workers):	        
-                seed_set.append(worker.seed.remote(seed))
-            ray.get(seed_set)
 
         res = self.workers[0].get_number_of_agents.remote()
         self.num_agents = ray.get(res)
 
         res = self.workers[0].get_env_info.remote()
         env_info = ray.get(res)
-        res = self.workers[0].can_concat_infos.remote()
-        can_concat_infos = ray.get(res)
+
         self.use_global_obs = env_info['use_global_observations']
-        self.concat_infos = can_concat_infos
+        self.concat_infos = False
         self.obs_type_dict = type(env_info.get('observation_space')) is gym.spaces.Dict
         self.state_type_dict = type(env_info.get('state_space')) is gym.spaces.Dict
         if self.num_agents == 1:
@@ -182,8 +157,7 @@ class RayVecEnv(IVecEnv):
 
     def get_action_masks(self):
         mask = [worker.get_action_mask.remote() for worker in self.workers]
-        masks = ray.get(mask)
-        return np.concatenate(masks, axis=0)
+        return np.asarray(ray.get(mask), dtype=np.int32)
 
     def reset(self):
         res_obs = [worker.reset.remote() for worker in self.workers]
@@ -211,6 +185,86 @@ class RayVecEnv(IVecEnv):
                 newobsdict["states"] = np.stack(newstates)            
             ret_obs = newobsdict
         return ret_obs
+# todo rename multi-agent
+class RayVecSMACEnv(IVecEnv):
+    def __init__(self, config_name, num_actors, **kwargs):
+        self.config_name = config_name
+        self.num_actors = num_actors
+        self.remote_worker = ray.remote(RayWorker)
+        self.workers = [self.remote_worker.remote(self.config_name, kwargs) for i in range(self.num_actors)]
+        
+        res = self.workers[0].get_number_of_agents.remote()
+        self.num_agents = ray.get(res)
+
+        res = self.workers[0].get_env_info.remote()
+        env_info = ray.get(res)
+
+        self.use_global_obs = env_info['use_global_observations']
+
+    def get_env_info(self):
+        res = self.workers[0].get_env_info.remote()
+        return ray.get(res)
+
+    def get_number_of_agents(self):
+        return self.num_agents
+
+    def step(self, actions):
+        newobs, newstates, newrewards, newdones, newinfos = [], [], [], [], []
+        newobsdict = {}
+        res_obs, res_state = [], []
+
+        for num, worker in enumerate(self.workers):
+            res_obs.append(worker.step.remote(actions[self.num_agents * num: self.num_agents * num + self.num_agents]))
+
+        for res in res_obs:
+            cobs, crewards, cdones, cinfos = ray.get(res)
+            if self.use_global_obs:
+                newobs.append(cobs["obs"])
+                newstates.append(cobs["state"])
+            else:
+                newobs.append(cobs)
+                
+            newrewards.append(crewards)
+            newdones.append(cdones)
+            newinfos.append(cinfos)
+
+        if self.use_global_obs:
+            newobsdict["obs"] = np.concatenate(newobs, axis=0)
+            newobsdict["states"] = np.asarray(newstates)
+            ret_obs = newobsdict
+        else:
+            ret_obs = np.concatenate(newobs, axis=0)
+
+        return ret_obs, np.concatenate(newrewards, axis=0), np.concatenate(newdones, axis=0), newinfos
+
+    def has_action_masks(self):
+        return True
+
+    def get_action_masks(self):
+        mask = [worker.get_action_mask.remote() for worker in self.workers]
+        masks = ray.get(mask)
+        return np.concatenate(masks, axis=0)
+
+    def reset(self):
+        res_obs = [worker.reset.remote() for worker in self.workers]
+        if self.use_global_obs:
+            newobs, newstates = [],[]
+            for res in res_obs:
+                cobs = ray.get(res)
+                if self.use_global_obs:
+                    newobs.append(cobs["obs"])
+                    newstates.append(cobs["state"])
+                else:
+                    newobs.append(cobs)
+            newobsdict = {}
+            newobsdict["obs"] = np.concatenate(newobs, axis=0)
+            newobsdict["states"] = np.asarray(newstates)
+            ret_obs = newobsdict
+        else:
+            ret_obs = ray.get(res_obs)
+            ret_obs = np.concatenate(ret_obs, axis=0)
+        return ret_obs
+
 
 vecenv_config = {}
 
@@ -222,9 +276,8 @@ def create_vec_env(config_name, num_actors, **kwargs):
     return vecenv_config[vec_env_name](config_name, num_actors, **kwargs)
 
 register('RAY', lambda config_name, num_actors, **kwargs: RayVecEnv(config_name, num_actors, **kwargs))
+register('RAY_SMAC', lambda config_name, num_actors, **kwargs: RayVecSMACEnv(config_name, num_actors, **kwargs))
 
 from rl_games.envs.brax import BraxEnv
 register('BRAX', lambda config_name, num_actors, **kwargs: BraxEnv(config_name, num_actors, **kwargs))
 
-from rl_games.envs.envpool import Envpool
-register('ENVPOOL', lambda config_name, num_actors, **kwargs: Envpool(config_name, num_actors, **kwargs))

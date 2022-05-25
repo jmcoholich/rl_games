@@ -5,6 +5,8 @@ params:
   model:
     name: discrete_a2c
 
+  load_checkpoint: False
+  load_path: path
   network:
     name: testnet
   config:
@@ -24,12 +26,12 @@ params:
     e_clip: 0.2
     clip_value: False
     num_actors: 16
-    horizon_length: 256
+    steps_num: 256
     minibatch_size: 2048
     mini_epochs: 4
     critic_coef: 1
     lr_schedule:  None
-    kl_threshold: 0.008
+    lr_threshold: 0.008
     normalize_input: False
     normalize_value: False
     weight_decay: 0.0000
@@ -53,7 +55,7 @@ params:
     central_value_config:
       minibatch_size: 512
       mini_epochs: 4
-      learning_rate: 5e-4
+      lr: 5e-4
       clip_value: False
       normalize_input: False
       truncate_grads: True
