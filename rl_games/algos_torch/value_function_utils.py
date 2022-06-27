@@ -8,12 +8,13 @@ from tasks.aliengo_utils.utils import batch_z_2D_rot_mat
 
 class ValueProcesser:
     def __init__(self, player, des_dir=0.0, des_dir_coef=0.0,
-            start_after_n_steps=60, file_prefix="value_search", box_len=0.15,
-            grid_points=13, random_footsteps=False):
+                 start_after_n_steps=60, file_prefix="value_search", box_len=0.15,
+                 grid_points=13, random_footsteps=False):
         """
         Update: This code is now vectorized across environments. The first
         dimension is always the environment dimension.
         """
+        # grid_points = 4  # this is for search 8D
         self.random_footsteps = random_footsteps
         self.player = player
         self.task = self.player.env.task
@@ -48,7 +49,7 @@ class ValueProcesser:
 
         self.foot_names = ["FL", "FR", "RL", "RR"]
 
-        if (self.grid_points - 1) % (self.num_plot_rows - 1) != 0:
+        if self.make_plots and (self.grid_points - 1) % (self.num_plot_rows - 1) != 0:
             raise ValueError("Number of grid points incompatible with "
                              "number of plots")
 
@@ -71,6 +72,7 @@ class ValueProcesser:
             # if self.task.is_stepping_stones:
             #     return self.search_stepping_stones(obs)
             return self.search_4D(obs)
+            # return self.search_8D(obs)
         else:
             return obs
             # self.four_feet_optim(obs)
@@ -181,6 +183,44 @@ class ValueProcesser:
     #     return optimal_targets, max_idx
 
 
+    def search_8D(self, obs):
+        """
+        I want to also modify the footsteps in place.
+        dim 0: foot 0  x
+        dim 1: foot 0  y
+        dim 2: foot 1  x
+        dim 3: foot 1  y
+
+        NEXT FOOTSTEP TARGET PAIR
+        dim 4: foot 0  x
+        dim 5: foot 0  y
+        dim 6: foot 1  x
+        dim 7: foot 1  y
+        """
+        output_obs = obs.clone()
+        test_obs = self.generate_8D_test_obs(obs)
+
+        values = self.get_values(
+            test_obs.view(self.num_envs * self.grid_points**8, self.obs_len))
+        values = values.view([self.num_envs] + [self.grid_points] * 8)
+
+        if self.optim_targets:
+            values = self.adjust_8D_values(values)
+            optimal_targets, optimal_next_next_targets, max_idx = self.get_optimal_targets_from_8D(values)
+
+            # apply first order low-pass filter
+
+            # self.fg.footsteps[self.env_arange, self.fg.current_footstep] = 0.1 * optimal_targets + 0.9 * self.fg.footsteps[self.env_arange, self.fg.current_footstep]
+            self.fg.footsteps[self.env_arange, self.fg.current_footstep] = optimal_targets
+            self.fg.footsteps[self.env_arange, self.fg.current_footstep + 1] = optimal_next_next_targets
+            self.fg.plot_footstep_targets(current_only=True)
+            if self.optmize_current_step:
+                output_obs = self.task.observe(recalculating_obs=True)
+
+        if self.make_plots or self.save_video_frames:
+            self.plot_4D_values(values[0], max_idx[0])
+        return output_obs
+
     def search_4D(self, obs):
         """
         I want to also modify the footsteps in place.
@@ -287,6 +327,87 @@ class ValueProcesser:
         return test_obs
     '''
 
+    def generate_8D_test_obs(self, obs):
+
+        p = 2  # this is the obs len per footstep target. Was previously 3
+        ea = self.env_arange
+        n_env = self.num_envs
+
+        test_obs = obs.view(n_env, 1, 1, 1, 1, 1, 1, 1, 1, self.obs_len).tile([1] + [self.grid_points] * 8 + [1])
+        foot_idcs = self.fg.get_footstep_idcs(self.fg.current_footstep)
+        # NOTE next line will fail if executed before agent hits first targets
+        prev_targets = self.fg.footsteps[ea, self.fg.current_footstep - 2]
+
+        # generate grids centered around previous footstep targets aligned
+        # with global coordinate system
+        # TODO make sure these actually update upon assignment
+        test_obs[ea, :, :, :, :, :, :, :, :, self.start_idx + foot_idcs[:, 0] * p] = \
+            self.grid.view(1, self.grid_points, 1, 1, 1, 1, 1, 1, 1) \
+            + prev_targets[:, 0, 0].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1) \
+            - self.task.foot_center_pos[ea, foot_idcs[:, 0], 0].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1)
+
+        test_obs[ea, :, :, :, :, :, :, :, :, self.start_idx + foot_idcs[:, 0] * p + 1] = \
+            self.grid.view(1, 1, self.grid_points, 1, 1, 1, 1, 1, 1) \
+            + prev_targets[:, 0, 1].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1) \
+            - self.task.foot_center_pos[ea, foot_idcs[:, 0], 1].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1)
+
+        test_obs[ea, :, :, :, :, :, :, :, :, self.start_idx + foot_idcs[:, 1] * p] = \
+            self.grid.view(1, 1, 1, self.grid_points, 1, 1, 1, 1, 1) \
+            + prev_targets[:, 1, 0].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1) \
+            - self.task.foot_center_pos[ea, foot_idcs[:, 1], 0].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1)
+
+        test_obs[ea, :, :, :, :, :, :, :, :, self.start_idx + foot_idcs[:, 1] * p + 1] = \
+            self.grid.view(1, 1, 1, 1, self.grid_points, 1, 1, 1, 1) \
+            + prev_targets[:, 1, 1].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1) \
+            - self.task.foot_center_pos[ea, foot_idcs[:, 1], 1].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1)
+
+        foot_idcs = self.fg.get_footstep_idcs(self.fg.current_footstep - 1)
+        prev_targets = self.fg.footsteps[ea, self.fg.current_footstep - 1]
+
+        test_obs[ea, :, :, :, :, :, :, :, :, self.start_idx + foot_idcs[:, 0] * p] = \
+            2 * self.grid.view(1, 1, 1, 1, 1, self.grid_points, 1, 1, 1) \
+            + prev_targets[:, 0, 0].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1) \
+            - self.task.foot_center_pos[ea, foot_idcs[:, 0], 0].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1)
+
+        test_obs[ea, :, :, :, :, :, :, :, :, self.start_idx + foot_idcs[:, 0] * p + 1] = \
+            2 * self.grid.view(1, 1, 1, 1, 1, 1, self.grid_points, 1, 1) \
+            + prev_targets[:, 0, 1].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1) \
+            - self.task.foot_center_pos[ea, foot_idcs[:, 0], 1].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1)
+
+        test_obs[ea, :, :, :, :, :, :, :, :, self.start_idx + foot_idcs[:, 1] * p] = \
+            2 * self.grid.view(1, 1, 1, 1, 1, 1, 1, self.grid_points, 1) \
+            + prev_targets[:, 1, 0].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1) \
+            - self.task.foot_center_pos[ea, foot_idcs[:, 1], 0].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1)
+
+        test_obs[ea, :, :, :, :, :, :, :, :, self.start_idx + foot_idcs[:, 1] * p + 1] = \
+            2 * self.grid.view(1, 1, 1, 1, 1, 1, 1, 1, self.grid_points) \
+            + prev_targets[:, 1, 1].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1) \
+            - self.task.foot_center_pos[ea, foot_idcs[:, 1], 1].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1)
+
+        # # subtract robot feet global positions from the grid
+        # test_obs[:, :, :, :, self.start_idx + foot_idcs[0] * p] -= \
+        #     self.task.foot_center_pos[0, foot_idcs[0], 0]
+        # test_obs[:, :, :, :, self.start_idx + foot_idcs[0] * p + 1] -= \
+        #     self.task.foot_center_pos[0, foot_idcs[0], 1]
+        # test_obs[:, :, :, :, self.start_idx + foot_idcs[1] * p] -= \
+        #     self.task.foot_center_pos[0, foot_idcs[1], 0]
+        # test_obs[:, :, :, :, self.start_idx + foot_idcs[1] * p + 1] -= \
+        #     self.task.foot_center_pos[0, foot_idcs[1], 1]
+
+        # rotate to align with robot yaw
+        yaw = self.task.base_euler[:, 2]
+        rot_mat = batch_z_2D_rot_mat(-yaw).view(n_env, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2)
+        ea = ea.unsqueeze(-1)
+
+        for i in range(self.num_envs):
+            rot_mat = batch_z_2D_rot_mat(-yaw[i])
+            test_obs[i, :, :, :, :, :, :, :, :, self.start_idx + foot_idcs[i, 0] * p: self.start_idx + foot_idcs[i, 0] * p + p] = \
+                (rot_mat @ test_obs[i, :, :, :, :, :, :, :, :, self.start_idx + foot_idcs[i, 0] * p: self.start_idx + foot_idcs[i, 0] * p + p].unsqueeze(-1)).squeeze(-1)
+            test_obs[i, :, :, :, :, :, :, :, :, self.start_idx + foot_idcs[i, 1] * p: self.start_idx + foot_idcs[i, 1] * p + p] = \
+                (rot_mat @ test_obs[i, :, :, :, :, :, :, :, :, self.start_idx + foot_idcs[i, 1] * p: self.start_idx + foot_idcs[i, 1] * p + p].unsqueeze(-1)).squeeze(-1)
+
+        return test_obs
+
     def generate_4D_test_obs(self, obs):
         """
         dim 0: foot 0  x
@@ -392,22 +513,39 @@ class ValueProcesser:
         optimal_targets = self.grid2m(max_idx).view(self.num_envs, 2, 2) \
             + self.fg.footsteps[self.env_arange, self.fg.current_footstep - 2]
 
-        # optimal_targets[0, 0] = self.grid2m(max_idx[0])
-        # optimal_targets[0, 1] = self.grid2m(max_idx[1])
-        # optimal_targets[1, 0] = self.grid2m(max_idx[2])
-        # optimal_targets[1, 1] = self.grid2m(max_idx[3])
-
-        # now add prev targets to grid positions
-        # prev_targets = self.fg.footsteps[0, self.fg.current_footstep[0] - 2]
-        # optimal_targets[:, :2] += prev_targets[:, :2]
-
         return optimal_targets, max_idx
 
-    def grid2m(self, idx):
+    def get_optimal_targets_from_8D(self, values):
+        # initialize with current targets (to keep correct z-height)
+        optimal_targets = torch.zeros(self.num_envs, 2, 2, device=self.device)
+        optimal_next_next_targets = torch.zeros(self.num_envs, 2, 2, device=self.device)
+
+        max_idx = (values == values.amax(dim=(1, 2, 3, 4, 5, 6, 7, 8), keepdim=True)).nonzero()
+        # prev line could return multiple indices equal to the max per env, so we just select the first one
+        # the first colum of max_idx is the env idx
+
+        # first row is always valid
+        valid_rows = torch.ones(max_idx.shape[0], device=self.device,
+                                dtype=torch.bool)
+        valid_rows[1:] = max_idx[:-1, 0] != max_idx[1:, 0]
+
+        # only take valid rows and chop off the env idx
+        max_idx = max_idx[valid_rows][:, 1:]
+
+        if self.random_footsteps:
+            max_idx = torch.randint_like(max_idx, low=0, high=self.grid_points)
+        optimal_targets = self.grid2m(max_idx[:, :4]).view(self.num_envs, 2, 2) \
+            + self.fg.footsteps[self.env_arange, self.fg.current_footstep - 2]
+        optimal_next_next_targets = self.grid2m(max_idx[:, 4:], grid_dialation=2.0).view(self.num_envs, 2, 2) \
+            + self.fg.footsteps[self.env_arange, self.fg.current_footstep - 1]
+
+        return optimal_targets, optimal_next_next_targets, max_idx
+
+    def grid2m(self, idx, grid_dialation=1):
         """Treats every input as a position in the grid.
         Works with tensors and numbers.
         """
-        return (idx / (self.grid_points - 1.0) - 0.5) * 2 * self.box_len
+        return (idx / (self.grid_points - 1.0) - 0.5) * 2 * self.box_len * grid_dialation
 
     def plot_4D_values(self, values, max_idx):
         if self.normalize_heatmap_scale:
@@ -504,6 +642,33 @@ class ValueProcesser:
         values[...] += self.grid.view(1, 1, self.grid_points, 1, 1) * y_coef
         values[...] += self.grid.view(1, 1, 1, self.grid_points, 1) * x_coef
         values[...] += self.grid.view(1, 1, 1, 1, self.grid_points) * y_coef
+
+        return values
+
+    def adjust_8D_values(self, values):
+        """Adds other optimzation terms (direction) to 4D values.
+
+        dim 0: foot 0  x
+        dim 1: foot 0  y
+        dim 2: foot 1  x
+        dim 3: foot 1  y
+        """
+        # self.des_dir = torch.tensor(
+        #     [self.pi * (self.task.progress_buf[0] % 4) / 2.0
+        #      + self.pi / 4.0],
+        #     device=self.device)
+        # values = torch.zeros([self.grid_points] * 4, device=self.device)
+        # values = torch.rand([self.grid_points] * 4, device=self.device)
+
+        # add directional coefficients
+        # mean_var = values.var() + 0.1
+        x_coef = self.des_dir.cos() * self.des_dir_weight  # * mean_var
+        y_coef = self.des_dir.sin() * self.des_dir_weight  # * mean_var
+
+        values[...] += self.grid.view(1, 1, 1, 1, 1, self.grid_points, 1, 1, 1) * x_coef
+        values[...] += self.grid.view(1, 1, 1, 1, 1, 1, self.grid_points, 1, 1) * y_coef
+        values[...] += self.grid.view(1, 1, 1, 1, 1, 1, 1, self.grid_points, 1) * x_coef
+        values[...] += self.grid.view(1, 1, 1, 1, 1, 1, 1, 1, self.grid_points) * y_coef
 
         return values
 
