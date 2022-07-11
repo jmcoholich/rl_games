@@ -26,7 +26,7 @@ def policy_kl(p0_mu, p0_sigma, p1_mu, p1_sigma, reduce=True):
     c2 = (p0_sigma**2 + (p1_mu - p0_mu)**2)/(2.0 * (p1_sigma**2 + 1e-5))
     c3 = -1.0 / 2.0
     kl = c1 + c2 + c3
-    kl = kl.sum(dim=-1) # returning mean between all steps of sum between all actions
+    kl = kl.sum(dim=-1)  # returning mean between all steps of sum between all actions
     if reduce:
         return kl.mean()
     else:
@@ -36,7 +36,7 @@ def mean_mask(input, mask, sum_mask):
     return (input * rnn_masks).sum() / sum_mask
 
 def shape_whc_to_cwh(shape):
-    #if len(shape) == 2:
+    # if len(shape) == 2:
     #    return (shape[1], shape[0])
     if len(shape) == 3:
         return (shape[2], shape[0], shape[1])
@@ -44,16 +44,17 @@ def shape_whc_to_cwh(shape):
     return shape
 
 def save_scheckpoint(filename, state):
+    state.pop('optimizer')  # NOTE this is to save file space. The optimizer state takes up 2/3rds of the file size, and I tend to never need to resume training, so its wasted
     print("=> saving checkpoint '{}'".format(filename + '.pth'))
 
     torch.save(state, filename + '.pth')
 
-def load_checkpoint(filename, ws):
+def load_checkpoint(filename, ws, device):
     import os
     if ws == -1:
         print("=> loading checkpoint '{}'".format(filename))
         path = os.path.join('./nn', filename, 'Aliengo.pth')
-        state = torch.load(path, map_location='cuda:0')
+        state = torch.load(path, map_location=device)
     else:
         print("=> loading checkpoint '{}' from workstation {}".format(filename,
                                                                       ws))
@@ -79,7 +80,7 @@ def load_checkpoint(filename, ws):
         sftp_client = ssh_client.open_sftp()
         path = os.path.join('isaacgym/python/rlgpu/nn', filename, 'Aliengo.pth')
         remote_file = sftp_client.open(path, 'rb')
-        state = torch.load(remote_file, map_location='cuda:0')
+        state = torch.load(remote_file, map_location=device)
     print('Agent Loaded\n\n')
 
     return state
@@ -108,7 +109,7 @@ def truncated_normal(uniform, mu=0.0, sigma=1.0, a=-2, b=2):
 def sample_truncated_normal(shape=(), mu=0.0, sigma=1.0, a=-2, b=2):
     return truncated_normal(torch.from_numpy(np.random.uniform(0, 1, shape)), mu, sigma, a, b)
 
-def variance_scaling_initializer(tensor, mode='fan_in',scale = 2.0):
+def variance_scaling_initializer(tensor, mode='fan_in', scale=2.0):
     fan = torch.nn.init._calculate_correct_fan(tensor, mode)
     print(fan, scale)
     sigma = np.sqrt(scale / fan)
@@ -132,7 +133,7 @@ def apply_masks(losses, mask=None):
     sum_mask = None
     if mask is not None:
         mask = mask.unsqueeze(1)
-        sum_mask = mask.numel()#
+        sum_mask = mask.numel()
         #sum_mask = mask.sum()
         res_losses = [(l * mask).sum() / sum_mask for l in losses]
     else:
@@ -152,10 +153,12 @@ def normalization_with_masks(values, masks):
 
 class CoordConv2d(nn.Conv2d):
     pool = {}
+
     def __init__(self, in_channels, out_channels, kernel_size, stride=1,
                  padding=0, dilation=1, groups=1, bias=True):
         super().__init__(in_channels + 2, out_channels, kernel_size, stride,
                          padding, dilation, groups, bias)
+
     @staticmethod
     def get_coord(x):
         key = int(x.size(0)), int(x.size(2)), int(x.size(3)), x.type()
@@ -165,9 +168,10 @@ class CoordConv2d(nn.Conv2d):
                 x.size(0), 1, 1, 1).type_as(x)
             CoordConv2d.pool[key] = coord
         return CoordConv2d.pool[key]
+
     def forward(self, x):
         return torch.nn.functional.conv2d(torch.cat([x, self.get_coord(x).type_as(x)], 1), self.weight, self.bias, self.stride,
-                        self.padding, self.dilation, self.groups)
+                                          self.padding, self.dilation, self.groups)
 
 class LayerNorm2d(nn.Module):
     """
@@ -196,7 +200,7 @@ class LayerNorm2d(nn.Module):
 
     def forward(self, x):
         self._check_input_dim(x)
-        x_flat = x.transpose(1,-1).contiguous().view((-1, x.size(1)))
+        x_flat = x.transpose(1, -1).contiguous().view((-1, x.size(1)))
         mean = x_flat.mean(0).unsqueeze(-1).unsqueeze(-1).expand_as(x)
         std = x_flat.std(0).unsqueeze(-1).unsqueeze(-1).expand_as(x)
         return self.gamma.expand_as(x) * (x - mean) / (std + self.eps) + self.beta.expand_as(x)
@@ -222,7 +226,7 @@ class DiscreteActionsEncoder(nn.Module):
             emb = self.embedding(discrete_actions)
         else:
             emb = torch.nn.functional.one_hot(discrete_actions, num_classes=self.actions_max)
-        emb = emb.view( -1, self.emb_size * self.num_agents).float()
+        emb = emb.view(-1, self.emb_size * self.num_agents).float()
         emb = self.linear(emb)
         return emb
 
@@ -269,9 +273,9 @@ class CategoricalMasked(torch.distributions.Categorical):
             super(CategoricalMasked, self).__init__(probs, logits, validate_args)
 
     def rsample(self):
-        u = torch.distributions.Uniform(low=torch.zeros_like(self.logits, device = self.logits.device), high=torch.ones_like(self.logits, device = self.logits.device)).sample()
+        u = torch.distributions.Uniform(low=torch.zeros_like(self.logits, device=self.logits.device), high=torch.ones_like(self.logits, device=self.logits.device)).sample()
         #print(u.size(), self.logits.size())
-        rand_logits = self.logits -(-u.log()).log()
+        rand_logits = self.logits - (-u.log()).log()
         return torch.max(rand_logits, axis=-1)[1]
 
     def entropy(self):
@@ -286,7 +290,7 @@ class AverageMeter(nn.Module):
         super(AverageMeter, self).__init__()
         self.max_size = max_size
         self.current_size = 0
-        self.register_buffer("mean", torch.zeros(in_shape, dtype = torch.float32))
+        self.register_buffer("mean", torch.zeros(in_shape, dtype=torch.float32))
 
     def update(self, values):
         size = values.size()[0]

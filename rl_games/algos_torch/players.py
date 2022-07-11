@@ -80,10 +80,10 @@ class PpoPlayerContinuous(BasePlayer):
         else:
             current_action = action
         current_action = torch.squeeze(current_action.detach())
-        return  rescale_actions(self.actions_low, self.actions_high, torch.clamp(current_action, -1.0, 1.0))
+        return rescale_actions(self.actions_low, self.actions_high, torch.clamp(current_action, -1.0, 1.0))
 
     def restore(self, fn, ws):
-        checkpoint = torch_ext.load_checkpoint(fn, ws)
+        checkpoint = torch_ext.load_checkpoint(fn, ws, self.device)
         self.model.load_state_dict(checkpoint['model'])
         if self.normalize_input:
             self.running_mean_std.load_state_dict(checkpoint['running_mean_std'])
@@ -123,7 +123,7 @@ class PpoPlayerDiscrete(BasePlayer):
             self.running_mean_std = RunningMeanStd(obs_shape).to(self.device)
             self.running_mean_std.eval()
 
-    def get_masked_action(self, obs, action_masks, is_determenistic = True):
+    def get_masked_action(self, obs, action_masks, is_determenistic=True):
         if self.has_batch_dimension == False:
             obs = unsqueeze_obs(obs)
         obs = self._preproc_obs(obs)
@@ -145,7 +145,7 @@ class PpoPlayerDiscrete(BasePlayer):
         if self.is_multi_discrete:
             if is_determenistic:
                 action = [torch.argmax(logit.detach(), axis=-1).squeeze() for logit in logits]
-                return torch.stack(action,dim=-1)
+                return torch.stack(action, dim=-1)
             else:
                 return action.squeeze().detach()
         else:
@@ -154,7 +154,7 @@ class PpoPlayerDiscrete(BasePlayer):
             else:
                 return action.squeeze().detach()
 
-    def get_action(self, obs, is_determenistic = False):
+    def get_action(self, obs, is_determenistic=False):
         if self.has_batch_dimension == False:
             obs = unsqueeze_obs(obs)
         obs = self._preproc_obs(obs)
@@ -173,7 +173,7 @@ class PpoPlayerDiscrete(BasePlayer):
         if self.is_multi_discrete:
             if is_determenistic:
                 action = [torch.argmax(logit.detach(), axis=1).squeeze() for logit in logits]
-                return torch.stack(action,dim=-1)
+                return torch.stack(action, dim=-1)
             else:
                 return action.squeeze().detach()
         else:
