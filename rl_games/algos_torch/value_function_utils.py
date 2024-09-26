@@ -273,7 +273,7 @@ class ValueProcesser:
             self.fg.footsteps[self.env_arange, self.fg.current_footstep] = optimal_targets
             self.fg.plot_footstep_targets(current_only=True)
             if self.optmize_current_step:
-                output_obs = self.task.observe(recalculating_obs=True)
+                output_obs = self.task.observe(recalculating_obs=True).clamp(-5.0, 5.0)
 
         if self.make_plots or self.save_video_frames:
             self.plot_4D_values(values[0], max_idx[0])
