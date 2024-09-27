@@ -753,8 +753,9 @@ class ValueProcesser:
             'obs' : test_obs,
             'rnn_states' : self.player.states
         }
-        with torch.no_grad():
-            res_dict = self.player.model(input_dict)
+        with torch.cuda.amp.autocast(enabled=True):
+            with torch.no_grad():
+                res_dict = self.player.model(input_dict)
         raw_values = res_dict["values"]
         values = self.player.value_mean_std(raw_values, unnorm=True)
         return values
