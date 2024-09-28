@@ -1206,4 +1206,9 @@ class ContinuousA2CBase(A2CBase):
                     print('MAX EPOCHS NUM!')
                     return self.last_mean_rewards, epoch_num
 
+                if epoch_num %  self.config['save_frequency'] == 0:
+                    name_for_interval_saving = self.network_path + 'last_' + self.config['name'] + 'ep=' + str(epoch_num) + 'rew=' + str(mean_rewards)
+                    print("Saving model at: ", name_for_interval_saving)
+                    self.save(name_for_interval_saving)
+
                 update_time = 0
