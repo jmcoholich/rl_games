@@ -31,8 +31,9 @@ class ValueProcesser:
         self.env_arange = torch.arange(self.num_envs, device=self.device)
 
         self.box_len = box_len  # this is actually half of box len
-        self.grid_points = grid_points
-        self.grid_points = 5
+        # self.grid_points = grid_points
+        self.h_grid_points = 5
+        self.l_grid_points = 2
         self.save_video_frames = False
         self.make_plots = False
 
@@ -56,8 +57,12 @@ class ValueProcesser:
             raise ValueError("Number of grid points incompatible with "
                              "number of plots")
 
-        self.grid = torch.linspace(-self.box_len, self.box_len,
-                                   self.grid_points, device=self.device)
+        # self.grid = torch.linspace(-self.box_len, self.box_len,
+                                #    self.grid_points, device=self.device)
+        self.h_grid = torch.linspace(-self.box_len * 2, self.box_len * 2,
+                                     self.h_grid_points, device=self.device)
+        self.l_grid = torch.linspace(-self.box_len, self.box_len,
+                                     self.l_grid_points, device=self.device)
 
         if self.task.is_stepping_stones:
             self.stone_pos = self.task.stepping_stones.stone_pos[0]
@@ -71,10 +76,12 @@ class ValueProcesser:
 
         self.obs_len = obs.shape[1]
 
-        if self.task.progress_buf[0] >= self.start_after_n_steps:
+        if self.task.progress_buf[0] >= self.start_after_n_steps:  # TODO this will mess up other envs!!
             # if self.task.is_stepping_stones:
             #     return self.search_stepping_stones(obs)
             # return self.search_4D(obs)
+            # if self.task.progress_buf[0] % 2 == 0:
+            #     return obs
             return self.gd_8D(obs)
             # return self.search_8D(obs)
         else:
@@ -192,12 +199,13 @@ class ValueProcesser:
         # params = torch.zeros(self.num_envs, 8, device=self.device, requires_grad=True)
         # if params is None:
         #     self.params = torch.zeros(self.num_envs, 8, device=self.device, requires_grad=True)
-        self.params = self.search_8D(obs)
+        self.params = self.search_8D(obs)  # TODO something is wrong with this shit
         # self.params = torch.zeros(self.num_envs, 8, device=self.device, requires_grad=True)
         self.params.requires_grad = True
-        self.optimizer = torch.optim.Adam([self.params], lr=0.001)
+        # self.optimizer = torch.optim.Adam([self.params], lr=0.001)
+        self.optimizer = torch.optim.SGD([self.params], lr=0.0001)
 
-        num_iters = 5
+        num_iters = 0
         for i in range(num_iters):
             self.optimizer.zero_grad()
             test_obs = self.generate_8D_test_obs(obs, self.params)
@@ -210,8 +218,8 @@ class ValueProcesser:
             # print()
             # print()
             # print()
-        print(loss)
-        breakpoint()
+        # print(loss)
+        # breakpoint()
         # set footstep targets
         # for i in range(0, 8, 2):
         #     print("norm", self.params[:, i:i+2].norm(dim=1).cpu().item())
@@ -236,6 +244,12 @@ class ValueProcesser:
         self.fg.footsteps[self.env_arange, self.fg.current_footstep, 1] = curr_opt_tgt_foot1.detach()
         self.fg.footsteps[self.env_arange, self.fg.current_footstep + 1, 0] = future_opt_tgt_foot0.detach()
         self.fg.footsteps[self.env_arange, self.fg.current_footstep + 1, 1] = future_opt_tgt_foot1.detach()
+
+        print(self.fg.current_footstep[0])
+        print(self.fg.footsteps[0, self.fg.current_footstep[0]-1])
+        print(self.fg.footsteps[0, self.fg.current_footstep[0]])
+        print(self.fg.footsteps[0, self.fg.current_footstep[0]+1])
+        print()
 
         self.fg.plot_footstep_targets(current_only=True)
         if self.optmize_current_step:
@@ -281,11 +295,11 @@ class ValueProcesser:
         test_obs = self.generate_8D_test_obs_grid(obs)
 
         values = self.get_values(
-            test_obs.view(self.num_envs * self.grid_points**8, self.obs_len))
-        values = values.view([self.num_envs] + [self.grid_points] * 8)
+            test_obs.view(self.num_envs * self.l_grid_points**4 * self.h_grid_points**4, self.obs_len))
+        values = values.view([self.num_envs] + [self.l_grid_points] * 4 + [self.h_grid_points] * 4)
 
         if self.optim_targets:
-            values = self.adjust_8D_values(values)
+            # values = self.adjust_8D_values(values)  # TODO
             optimal_targets, optimal_next_next_targets, max_idx = self.get_optimal_targets_from_8D(values)
             outputs = []
             curr_footstep_idcs = self.fg.get_footstep_idcs(self.fg.current_footstep)
@@ -302,16 +316,16 @@ class ValueProcesser:
 
             # apply first order low-pass filter
 
-            # self.fg.footsteps[self.env_arange, self.fg.current_footstep] = 0.1 * optimal_targets + 0.9 * self.fg.footsteps[self.env_arange, self.fg.current_footstep]
-            self.fg.footsteps[self.env_arange, self.fg.current_footstep] = optimal_targets
-            self.fg.footsteps[self.env_arange, self.fg.current_footstep + 1] = optimal_next_next_targets
-            self.fg.plot_footstep_targets(current_only=True)
-            if self.optmize_current_step:
-                output_obs = self.task.observe(recalculating_obs=True)
+        #     # self.fg.footsteps[self.env_arange, self.fg.current_footstep] = 0.1 * optimal_targets + 0.9 * self.fg.footsteps[self.env_arange, self.fg.current_footstep]
+        #     self.fg.footsteps[self.env_arange, self.fg.current_footstep] = optimal_targets
+        #     self.fg.footsteps[self.env_arange, self.fg.current_footstep + 1] = optimal_next_next_targets
+        #     self.fg.plot_footstep_targets(current_only=True)
+        #     if self.optmize_current_step:
+        #         output_obs = self.task.observe(recalculating_obs=True)
 
-        if self.make_plots or self.save_video_frames:
-            self.plot_4D_values(values[0], max_idx[0])
-        return output_obs
+        # if self.make_plots or self.save_video_frames:
+        #     self.plot_4D_values(values[0], max_idx[0])
+        # return output_obs
 
     def search_4D(self, obs):
         """
@@ -344,8 +358,8 @@ class ValueProcesser:
         values = self.get_values(
             test_obs.view(self.num_envs * self.grid_points**4, self.obs_len))
         values = values.view([self.num_envs] + [self.grid_points] * 4)
-        print(-values.max())
-        breakpoint()
+        # print(-values.max())
+        # breakpoint()
 
         # values_old = self.get_values(
         #     test_obs_old.view(self.grid_points**4, self.obs_len))
@@ -395,7 +409,7 @@ class ValueProcesser:
         ea = self.env_arange
         n_env = self.num_envs
 
-        test_obs = obs.view(n_env, 1, 1, 1, 1, 1, 1, 1, 1, self.obs_len).tile([1] + [self.grid_points] * 8 + [1])
+        test_obs = obs.view(n_env, 1, 1, 1, 1, 1, 1, 1, 1, self.obs_len).tile([1] + [self.l_grid_points] * 4 + [self.h_grid_points] * 4 + [1])
         foot_idcs = self.fg.get_footstep_idcs(self.fg.current_footstep)
         # NOTE next line will fail if executed before agent hits first targets
         prev_targets = self.fg.footsteps[ea, self.fg.current_footstep - 2]
@@ -404,22 +418,22 @@ class ValueProcesser:
         # with global coordinate system
         # TODO make sure these actually update upon assignment
         test_obs[ea, :, :, :, :, :, :, :, :, self.start_idx + foot_idcs[:, 0] * p] = \
-            self.grid.view(1, self.grid_points, 1, 1, 1, 1, 1, 1, 1) \
+            self.l_grid.view(1, self.l_grid_points, 1, 1, 1, 1, 1, 1, 1) \
             + prev_targets[:, 0, 0].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1) \
             - self.task.foot_center_pos[ea, foot_idcs[:, 0], 0].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1)
 
         test_obs[ea, :, :, :, :, :, :, :, :, self.start_idx + foot_idcs[:, 0] * p + 1] = \
-            self.grid.view(1, 1, self.grid_points, 1, 1, 1, 1, 1, 1) \
+            self.l_grid.view(1, 1, self.l_grid_points, 1, 1, 1, 1, 1, 1) \
             + prev_targets[:, 0, 1].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1) \
             - self.task.foot_center_pos[ea, foot_idcs[:, 0], 1].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1)
 
         test_obs[ea, :, :, :, :, :, :, :, :, self.start_idx + foot_idcs[:, 1] * p] = \
-            self.grid.view(1, 1, 1, self.grid_points, 1, 1, 1, 1, 1) \
+            self.l_grid.view(1, 1, 1, self.l_grid_points, 1, 1, 1, 1, 1) \
             + prev_targets[:, 1, 0].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1) \
             - self.task.foot_center_pos[ea, foot_idcs[:, 1], 0].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1)
 
         test_obs[ea, :, :, :, :, :, :, :, :, self.start_idx + foot_idcs[:, 1] * p + 1] = \
-            self.grid.view(1, 1, 1, 1, self.grid_points, 1, 1, 1, 1) \
+            self.l_grid.view(1, 1, 1, 1, self.l_grid_points, 1, 1, 1, 1) \
             + prev_targets[:, 1, 1].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1) \
             - self.task.foot_center_pos[ea, foot_idcs[:, 1], 1].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1)
 
@@ -427,22 +441,22 @@ class ValueProcesser:
         prev_targets = self.fg.footsteps[ea, self.fg.current_footstep - 1]
 
         test_obs[ea, :, :, :, :, :, :, :, :, self.start_idx + foot_idcs[:, 0] * p] = \
-            2 * self.grid.view(1, 1, 1, 1, 1, self.grid_points, 1, 1, 1) \
+            self.h_grid.view(1, 1, 1, 1, 1, self.h_grid_points, 1, 1, 1) \
             + prev_targets[:, 0, 0].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1) \
             - self.task.foot_center_pos[ea, foot_idcs[:, 0], 0].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1)
 
         test_obs[ea, :, :, :, :, :, :, :, :, self.start_idx + foot_idcs[:, 0] * p + 1] = \
-            2 * self.grid.view(1, 1, 1, 1, 1, 1, self.grid_points, 1, 1) \
+            self.h_grid.view(1, 1, 1, 1, 1, 1, self.h_grid_points, 1, 1) \
             + prev_targets[:, 0, 1].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1) \
             - self.task.foot_center_pos[ea, foot_idcs[:, 0], 1].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1)
 
         test_obs[ea, :, :, :, :, :, :, :, :, self.start_idx + foot_idcs[:, 1] * p] = \
-            2 * self.grid.view(1, 1, 1, 1, 1, 1, 1, self.grid_points, 1) \
+            self.h_grid.view(1, 1, 1, 1, 1, 1, 1, self.h_grid_points, 1) \
             + prev_targets[:, 1, 0].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1) \
             - self.task.foot_center_pos[ea, foot_idcs[:, 1], 0].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1)
 
         test_obs[ea, :, :, :, :, :, :, :, :, self.start_idx + foot_idcs[:, 1] * p + 1] = \
-            2 * self.grid.view(1, 1, 1, 1, 1, 1, 1, 1, self.grid_points) \
+            self.h_grid.view(1, 1, 1, 1, 1, 1, 1, 1, self.h_grid_points) \
             + prev_targets[:, 1, 1].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1) \
             - self.task.foot_center_pos[ea, foot_idcs[:, 1], 1].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1)
 
@@ -738,13 +752,13 @@ class ValueProcesser:
         # only take valid rows and chop off the env idx
         max_idx = max_idx[valid_rows][:, 1:]
 
-        if self.random_footsteps:
-            max_idx = torch.randint_like(max_idx, low=0, high=self.grid_points)
-        optimal_targets = self.grid2m(max_idx[:, :4]).view(self.num_envs, 2, 2) \
-            + self.fg.footsteps[self.env_arange, self.fg.current_footstep - 2]
-        optimal_next_next_targets = self.grid2m(max_idx[:, 4:], grid_dialation=2.0).view(self.num_envs, 2, 2) \
-            + self.fg.footsteps[self.env_arange, self.fg.current_footstep - 1]
-
+        # if self.random_footsteps:
+        #     max_idx = torch.randint_like(max_idx, low=0, high=self.grid_points)
+        # optimal_targets = self.grid2m(max_idx[:, :4]).view(self.num_envs, 2, 2) \
+        #     + self.fg.footsteps[self.env_arange, self.fg.current_footstep - 2]
+        # optimal_next_next_targets = self.grid2m(max_idx[:, 4:], grid_dialation=2.0).view(self.num_envs, 2, 2) \
+        #     + self.fg.footsteps[self.env_arange, self.fg.current_footstep - 1]
+        optimal_next_next_targets = None
         return optimal_targets, optimal_next_next_targets, max_idx
 
     def grid2m(self, idx, grid_dialation=1):
