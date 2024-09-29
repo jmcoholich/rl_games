@@ -31,11 +31,8 @@ class ValueProcesser:
         self.env_arange = torch.arange(self.num_envs, device=self.device)
 
         self.box_len = box_len  # this is actually half of box len
-        if PLOT:
-            self.box_len = 0.1
         self.grid_points = grid_points
-        if PLOT:
-            self.grid_points = 4
+        self.grid_points = 17
         self.save_video_frames = False
         self.make_plots = False
 
@@ -77,7 +74,8 @@ class ValueProcesser:
         if self.task.progress_buf[0] >= self.start_after_n_steps:
             # if self.task.is_stepping_stones:
             #     return self.search_stepping_stones(obs)
-            return self.search_4D(obs)
+            # return self.search_4D(obs)
+            return self.gd_8D(obs)
             # return self.search_8D(obs)
         else:
             return obs
@@ -187,7 +185,80 @@ class ValueProcesser:
 
     #     optimal_targets = torch.stack((ss0, ss1))
     #     return optimal_targets, max_idx
+    def gd_8D(self, obs, params=None):
 
+        # init sgd optimizer
+        obs = obs.clone()
+        # params = torch.zeros(self.num_envs, 8, device=self.device, requires_grad=True)
+        if params is None:
+            self.params = torch.zeros(self.num_envs, 8, device=self.device, requires_grad=True)
+        self.optimizer = torch.optim.Adam([self.params], lr=0.01)
+
+        num_iters = 5
+        for i in range(num_iters):
+            self.optimizer.zero_grad()
+            test_obs = self.generate_8D_test_obs(obs, self.params)
+            loss = self.loss_8D(test_obs)
+            loss.backward(retain_graph=True)
+            # print("after backward", params.grad)
+            self.optimizer.step()
+            # print(f"iter {i}, loss {loss.item()}, params {test_obs[0, self.start_idx: self.start_idx + 12].detach().cpu().numpy()}")
+            # print(params)
+            # print()
+            # print()
+            # print()
+        # print(loss)
+        # breakpoint()
+        # set footstep targets
+        # for i in range(0, 8, 2):
+        #     print("norm", self.params[:, i:i+2].norm(dim=1).cpu().item())
+        # print()
+        yaws = self.task.base_euler[:, 2]
+        rot_mats = batch_z_2D_rot_mat(yaws)
+        curr_footstep_idcs = self.fg.get_footstep_idcs(self.fg.current_footstep)
+        fut_footstep_idcs = self.fg.get_footstep_idcs(self.fg.current_footstep + 1)
+
+        # transform from obs space to world space
+        curr_opt_tgt_foot0 = (rot_mats @ self.params[:, :2].view(self.num_envs, 2, 1)).squeeze(-1) + self.task.foot_center_pos[self.env_arange, curr_footstep_idcs[:, 0], :2]
+
+        curr_opt_tgt_foot1 = (rot_mats @ self.params[:, 2:4].view(self.num_envs, 2, 1)).squeeze(-1) + self.task.foot_center_pos[self.env_arange, curr_footstep_idcs[:, 1], :2]
+
+        future_opt_tgt_foot0 = (rot_mats @ self.params[:, 4:6].view(self.num_envs, 2, 1)).squeeze(-1) + self.task.foot_center_pos[self.env_arange, fut_footstep_idcs[:, 0], :2]
+
+        future_opt_tgt_foot1 = (rot_mats @ self.params[:, 6:8].view(self.num_envs, 2, 1)).squeeze(-1) + self.task.foot_center_pos[self.env_arange, fut_footstep_idcs[:, 1], :2]
+
+
+        # assign back to footstep targets
+        self.fg.footsteps[self.env_arange, self.fg.current_footstep, 0] = curr_opt_tgt_foot0.detach()
+        self.fg.footsteps[self.env_arange, self.fg.current_footstep, 1] = curr_opt_tgt_foot1.detach()
+        self.fg.footsteps[self.env_arange, self.fg.current_footstep + 1, 0] = future_opt_tgt_foot0.detach()
+        self.fg.footsteps[self.env_arange, self.fg.current_footstep + 1, 1] = future_opt_tgt_foot1.detach()
+
+        self.fg.plot_footstep_targets(current_only=True)
+        if self.optmize_current_step:
+            output_obs = self.task.observe(recalculating_obs=True).clamp(-5.0, 5.0)
+            # print(self.fg.get_footstep_idcs(self.fg.current_footstep))
+            # print(self.params)
+            # print(output_obs[:, self.start_idx: self.start_idx + 12])
+            # print()
+            # breakpoint()
+
+        return output_obs
+
+    def loss_8D(self, obs):
+        values = self.get_values(obs)
+        loss = -torch.mean(values)
+        return loss
+
+    def generate_8D_test_obs(self, obs, params):
+        foot_idcs = self.fg.get_footstep_idcs(self.fg.current_footstep)
+        # set first footstep
+        obs[self.env_arange, self.start_idx + foot_idcs[:, 0]: self.start_idx + foot_idcs[:, 0] + 2] = params[:, :2]
+        # set second footstep
+        obs[self.env_arange, self.start_idx + foot_idcs[:, 1]: self.start_idx + foot_idcs[:, 1] + 2] = params[:, 2:4]
+        # set future footstep
+        obs[:, self.start_idx + 8: self.start_idx + 12] = params[:, 4:]
+        return obs
 
     def search_8D(self, obs):
         """
@@ -237,7 +308,12 @@ class ValueProcesser:
         """
         output_obs = obs.clone()
         test_obs = self.generate_4D_test_obs(obs)
-        # car_prod_obs = self.generate_4D_test_obs_cart_prod(obs)
+        # new = test_obs.view(self.task.num_envs, -1, test_obs.shape[-1])
+        # test_obs = self.generate_4D_test_obs_cart_prod(obs)
+        # new2 = []
+        # for batch in test_obs:
+        #     new2.append(batch)
+        # breakpoint()
 
         # test_obs_old = self.generate_4D_test_obs_old(obs, 0)
 
@@ -253,6 +329,8 @@ class ValueProcesser:
         values = self.get_values(
             test_obs.view(self.num_envs * self.grid_points**4, self.obs_len))
         values = values.view([self.num_envs] + [self.grid_points] * 4)
+        print(-values.max())
+        breakpoint()
 
         # values_old = self.get_values(
         #     test_obs_old.view(self.grid_points**4, self.obs_len))
@@ -296,97 +374,137 @@ class ValueProcesser:
         return output_obs
 
 
-    def generate_8D_test_obs(self, obs):
+    # def generate_8D_test_obs(self, obs):
 
-        p = 2  # this is the obs len per footstep target. Was previously 3
-        ea = self.env_arange
-        n_env = self.num_envs
+    #     p = 2  # this is the obs len per footstep target. Was previously 3
+    #     ea = self.env_arange
+    #     n_env = self.num_envs
 
-        test_obs = obs.view(n_env, 1, 1, 1, 1, 1, 1, 1, 1, self.obs_len).tile([1] + [self.grid_points] * 8 + [1])
-        foot_idcs = self.fg.get_footstep_idcs(self.fg.current_footstep)
-        # NOTE next line will fail if executed before agent hits first targets
-        prev_targets = self.fg.footsteps[ea, self.fg.current_footstep - 2]
+    #     test_obs = obs.view(n_env, 1, 1, 1, 1, 1, 1, 1, 1, self.obs_len).tile([1] + [self.grid_points] * 8 + [1])
+    #     foot_idcs = self.fg.get_footstep_idcs(self.fg.current_footstep)
+    #     # NOTE next line will fail if executed before agent hits first targets
+    #     prev_targets = self.fg.footsteps[ea, self.fg.current_footstep - 2]
 
-        # generate grids centered around previous footstep targets aligned
-        # with global coordinate system
-        # TODO make sure these actually update upon assignment
-        test_obs[ea, :, :, :, :, :, :, :, :, self.start_idx + foot_idcs[:, 0] * p] = \
-            self.grid.view(1, self.grid_points, 1, 1, 1, 1, 1, 1, 1) \
-            + prev_targets[:, 0, 0].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1) \
-            - self.task.foot_center_pos[ea, foot_idcs[:, 0], 0].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1)
+    #     # generate grids centered around previous footstep targets aligned
+    #     # with global coordinate system
+    #     # TODO make sure these actually update upon assignment
+    #     test_obs[ea, :, :, :, :, :, :, :, :, self.start_idx + foot_idcs[:, 0] * p] = \
+    #         self.grid.view(1, self.grid_points, 1, 1, 1, 1, 1, 1, 1) \
+    #         + prev_targets[:, 0, 0].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1) \
+    #         - self.task.foot_center_pos[ea, foot_idcs[:, 0], 0].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1)
 
-        test_obs[ea, :, :, :, :, :, :, :, :, self.start_idx + foot_idcs[:, 0] * p + 1] = \
-            self.grid.view(1, 1, self.grid_points, 1, 1, 1, 1, 1, 1) \
-            + prev_targets[:, 0, 1].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1) \
-            - self.task.foot_center_pos[ea, foot_idcs[:, 0], 1].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1)
+    #     test_obs[ea, :, :, :, :, :, :, :, :, self.start_idx + foot_idcs[:, 0] * p + 1] = \
+    #         self.grid.view(1, 1, self.grid_points, 1, 1, 1, 1, 1, 1) \
+    #         + prev_targets[:, 0, 1].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1) \
+    #         - self.task.foot_center_pos[ea, foot_idcs[:, 0], 1].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1)
 
-        test_obs[ea, :, :, :, :, :, :, :, :, self.start_idx + foot_idcs[:, 1] * p] = \
-            self.grid.view(1, 1, 1, self.grid_points, 1, 1, 1, 1, 1) \
-            + prev_targets[:, 1, 0].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1) \
-            - self.task.foot_center_pos[ea, foot_idcs[:, 1], 0].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1)
+    #     test_obs[ea, :, :, :, :, :, :, :, :, self.start_idx + foot_idcs[:, 1] * p] = \
+    #         self.grid.view(1, 1, 1, self.grid_points, 1, 1, 1, 1, 1) \
+    #         + prev_targets[:, 1, 0].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1) \
+    #         - self.task.foot_center_pos[ea, foot_idcs[:, 1], 0].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1)
 
-        test_obs[ea, :, :, :, :, :, :, :, :, self.start_idx + foot_idcs[:, 1] * p + 1] = \
-            self.grid.view(1, 1, 1, 1, self.grid_points, 1, 1, 1, 1) \
-            + prev_targets[:, 1, 1].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1) \
-            - self.task.foot_center_pos[ea, foot_idcs[:, 1], 1].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1)
+    #     test_obs[ea, :, :, :, :, :, :, :, :, self.start_idx + foot_idcs[:, 1] * p + 1] = \
+    #         self.grid.view(1, 1, 1, 1, self.grid_points, 1, 1, 1, 1) \
+    #         + prev_targets[:, 1, 1].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1) \
+    #         - self.task.foot_center_pos[ea, foot_idcs[:, 1], 1].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1)
 
-        foot_idcs = self.fg.get_footstep_idcs(self.fg.current_footstep - 1)
-        prev_targets = self.fg.footsteps[ea, self.fg.current_footstep - 1]
+    #     foot_idcs = self.fg.get_footstep_idcs(self.fg.current_footstep - 1)
+    #     prev_targets = self.fg.footsteps[ea, self.fg.current_footstep - 1]
 
-        test_obs[ea, :, :, :, :, :, :, :, :, self.start_idx + foot_idcs[:, 0] * p] = \
-            2 * self.grid.view(1, 1, 1, 1, 1, self.grid_points, 1, 1, 1) \
-            + prev_targets[:, 0, 0].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1) \
-            - self.task.foot_center_pos[ea, foot_idcs[:, 0], 0].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1)
+    #     test_obs[ea, :, :, :, :, :, :, :, :, self.start_idx + foot_idcs[:, 0] * p] = \
+    #         2 * self.grid.view(1, 1, 1, 1, 1, self.grid_points, 1, 1, 1) \
+    #         + prev_targets[:, 0, 0].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1) \
+    #         - self.task.foot_center_pos[ea, foot_idcs[:, 0], 0].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1)
 
-        test_obs[ea, :, :, :, :, :, :, :, :, self.start_idx + foot_idcs[:, 0] * p + 1] = \
-            2 * self.grid.view(1, 1, 1, 1, 1, 1, self.grid_points, 1, 1) \
-            + prev_targets[:, 0, 1].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1) \
-            - self.task.foot_center_pos[ea, foot_idcs[:, 0], 1].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1)
+    #     test_obs[ea, :, :, :, :, :, :, :, :, self.start_idx + foot_idcs[:, 0] * p + 1] = \
+    #         2 * self.grid.view(1, 1, 1, 1, 1, 1, self.grid_points, 1, 1) \
+    #         + prev_targets[:, 0, 1].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1) \
+    #         - self.task.foot_center_pos[ea, foot_idcs[:, 0], 1].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1)
 
-        test_obs[ea, :, :, :, :, :, :, :, :, self.start_idx + foot_idcs[:, 1] * p] = \
-            2 * self.grid.view(1, 1, 1, 1, 1, 1, 1, self.grid_points, 1) \
-            + prev_targets[:, 1, 0].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1) \
-            - self.task.foot_center_pos[ea, foot_idcs[:, 1], 0].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1)
+    #     test_obs[ea, :, :, :, :, :, :, :, :, self.start_idx + foot_idcs[:, 1] * p] = \
+    #         2 * self.grid.view(1, 1, 1, 1, 1, 1, 1, self.grid_points, 1) \
+    #         + prev_targets[:, 1, 0].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1) \
+    #         - self.task.foot_center_pos[ea, foot_idcs[:, 1], 0].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1)
 
-        test_obs[ea, :, :, :, :, :, :, :, :, self.start_idx + foot_idcs[:, 1] * p + 1] = \
-            2 * self.grid.view(1, 1, 1, 1, 1, 1, 1, 1, self.grid_points) \
-            + prev_targets[:, 1, 1].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1) \
-            - self.task.foot_center_pos[ea, foot_idcs[:, 1], 1].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1)
+    #     test_obs[ea, :, :, :, :, :, :, :, :, self.start_idx + foot_idcs[:, 1] * p + 1] = \
+    #         2 * self.grid.view(1, 1, 1, 1, 1, 1, 1, 1, self.grid_points) \
+    #         + prev_targets[:, 1, 1].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1) \
+    #         - self.task.foot_center_pos[ea, foot_idcs[:, 1], 1].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1)
 
-        # # subtract robot feet global positions from the grid
-        # test_obs[:, :, :, :, self.start_idx + foot_idcs[0] * p] -= \
-        #     self.task.foot_center_pos[0, foot_idcs[0], 0]
-        # test_obs[:, :, :, :, self.start_idx + foot_idcs[0] * p + 1] -= \
-        #     self.task.foot_center_pos[0, foot_idcs[0], 1]
-        # test_obs[:, :, :, :, self.start_idx + foot_idcs[1] * p] -= \
-        #     self.task.foot_center_pos[0, foot_idcs[1], 0]
-        # test_obs[:, :, :, :, self.start_idx + foot_idcs[1] * p + 1] -= \
-        #     self.task.foot_center_pos[0, foot_idcs[1], 1]
+    #     # # subtract robot feet global positions from the grid
+    #     # test_obs[:, :, :, :, self.start_idx + foot_idcs[0] * p] -= \
+    #     #     self.task.foot_center_pos[0, foot_idcs[0], 0]
+    #     # test_obs[:, :, :, :, self.start_idx + foot_idcs[0] * p + 1] -= \
+    #     #     self.task.foot_center_pos[0, foot_idcs[0], 1]
+    #     # test_obs[:, :, :, :, self.start_idx + foot_idcs[1] * p] -= \
+    #     #     self.task.foot_center_pos[0, foot_idcs[1], 0]
+    #     # test_obs[:, :, :, :, self.start_idx + foot_idcs[1] * p + 1] -= \
+    #     #     self.task.foot_center_pos[0, foot_idcs[1], 1]
 
-        # rotate to align with robot yaw
-        yaw = self.task.base_euler[:, 2]
-        rot_mat = batch_z_2D_rot_mat(-yaw).view(n_env, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2)
-        ea = ea.unsqueeze(-1)
+    #     # rotate to align with robot yaw
+    #     yaw = self.task.base_euler[:, 2]
+    #     rot_mat = batch_z_2D_rot_mat(-yaw).view(n_env, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2)
+    #     ea = ea.unsqueeze(-1)
 
-        for i in range(self.num_envs):
-            rot_mat = batch_z_2D_rot_mat(-yaw[i])
-            test_obs[i, :, :, :, :, :, :, :, :, self.start_idx + foot_idcs[i, 0] * p: self.start_idx + foot_idcs[i, 0] * p + p] = \
-                (rot_mat @ test_obs[i, :, :, :, :, :, :, :, :, self.start_idx + foot_idcs[i, 0] * p: self.start_idx + foot_idcs[i, 0] * p + p].unsqueeze(-1)).squeeze(-1)
-            test_obs[i, :, :, :, :, :, :, :, :, self.start_idx + foot_idcs[i, 1] * p: self.start_idx + foot_idcs[i, 1] * p + p] = \
-                (rot_mat @ test_obs[i, :, :, :, :, :, :, :, :, self.start_idx + foot_idcs[i, 1] * p: self.start_idx + foot_idcs[i, 1] * p + p].unsqueeze(-1)).squeeze(-1)
-
-        return test_obs
-
-    # def generate_4D_test_obs_cart_prod(self, obs):
-    #     # I don't expect to be doing this for many envs at a time, so I will just loop over envs
-    #     # unfortunately there is no batched version of cartesian_prod
     #     for i in range(self.num_envs):
-    #         temp = torch.cartesian_prod(
-    #             self.grid,
-    #             self.grid,
-    #             self.grid,
-    #             self.grid,
-    #             )
+    #         rot_mat = batch_z_2D_rot_mat(-yaw[i])
+    #         test_obs[i, :, :, :, :, :, :, :, :, self.start_idx + foot_idcs[i, 0] * p: self.start_idx + foot_idcs[i, 0] * p + p] = \
+    #             (rot_mat @ test_obs[i, :, :, :, :, :, :, :, :, self.start_idx + foot_idcs[i, 0] * p: self.start_idx + foot_idcs[i, 0] * p + p].unsqueeze(-1)).squeeze(-1)
+    #         test_obs[i, :, :, :, :, :, :, :, :, self.start_idx + foot_idcs[i, 1] * p: self.start_idx + foot_idcs[i, 1] * p + p] = \
+    #             (rot_mat @ test_obs[i, :, :, :, :, :, :, :, :, self.start_idx + foot_idcs[i, 1] * p: self.start_idx + foot_idcs[i, 1] * p + p].unsqueeze(-1)).squeeze(-1)
+
+    #     return test_obs
+
+    def generate_4D_test_obs_cart_prod(self, obs):
+        # I don't expect to be doing this for many envs at a time, so I will just loop over envs
+        # unfortunately there is no batched version of cartesian_prod, so I'm using a for loop
+
+        # TODO for now just return the same thing as generate_4D_test_obs. After testing this, switch to returning a memory-efficient iterator
+        output = []
+        for i in range(self.num_envs):
+            orig_obs = obs[i].clone()
+            orig_footstep_obs = orig_obs[self.start_idx:self.start_idx + 8]
+            foot_idcs = self.fg.get_footstep_idcs(self.fg.current_footstep)[i]
+            prev_targets = self.fg.footsteps[i, self.fg.current_footstep[i] - 2]
+            temp = torch.cartesian_prod(
+                self.grid + prev_targets[0, 0] - self.task.foot_center_pos[i, foot_idcs[0], 0],  # foot 0  x
+                self.grid + prev_targets[0, 1] - self.task.foot_center_pos[i, foot_idcs[0], 1],  # foot 0  y
+                self.grid + prev_targets[1, 0] - self.task.foot_center_pos[i, foot_idcs[1], 0],  # foot 1  x
+                self.grid + prev_targets[1, 1] - self.task.foot_center_pos[i, foot_idcs[1], 1],  # foot 1  y
+                )
+            yaw = self.task.base_euler[i, 2]
+            rot_mat = batch_z_2D_rot_mat(-yaw)
+            temp[:, 0:2] = (rot_mat @ temp[:, 0:2].unsqueeze(-1)).squeeze(-1)
+            temp[:, 2:4] = (rot_mat @ temp[:, 2:4].unsqueeze(-1)).squeeze(-1)
+            footstep_obs = torch.zeros(temp.shape[0], 8, device=self.device)
+            if foot_idcs[0] == 1:  # idcs are [1, 2] These are the idcs being optimized over
+                assert foot_idcs[1] == 2
+                footstep_obs[:, 0] = orig_footstep_obs[0]
+                footstep_obs[:, 1] = orig_footstep_obs[1]
+                footstep_obs[:, 2] = temp[:, 0]
+                footstep_obs[:, 3] = temp[:, 1]
+                footstep_obs[:, 4] = temp[:, 2]
+                footstep_obs[:, 5] = temp[:, 3]
+                footstep_obs[:, 6] = orig_footstep_obs[6]
+                footstep_obs[:, 7] = orig_footstep_obs[7]
+            elif foot_idcs[0] == 0:
+                assert foot_idcs[1] == 3
+                footstep_obs[:, 0] = temp[:, 0]
+                footstep_obs[:, 1] = temp[:, 1]
+                footstep_obs[:, 2] = orig_footstep_obs[2]
+                footstep_obs[:, 3] = orig_footstep_obs[3]
+                footstep_obs[:, 4] = orig_footstep_obs[4]
+                footstep_obs[:, 5] = orig_footstep_obs[5]
+                footstep_obs[:, 6] = temp[:, 2]
+                footstep_obs[:, 7] = temp[:, 3]
+            else:
+                raise ValueError
+            obs = torch.zeros(temp.shape[0], orig_obs.shape[0], device=self.device)
+            obs[:] = orig_obs
+            obs[:, self.start_idx:self.start_idx + 8] = footstep_obs
+            output.append(obs)
+            breakpoint()
+        return MyIterator(torch.stack(output))
 
     def generate_4D_test_obs(self, obs):
         """
@@ -753,10 +871,26 @@ class ValueProcesser:
             'obs' : test_obs,
             'rnn_states' : self.player.states
         }
-        with torch.cuda.amp.autocast(enabled=True):
-            with torch.no_grad():
-                res_dict = self.player.model(input_dict)
+        with torch.cuda.amp.autocast(enabled=False):
+            res_dict = self.player.model(input_dict)
         raw_values = res_dict["values"]
         values = self.player.value_mean_std(raw_values, unnorm=True)
         return values
 
+
+class MyIterator:
+    def __init__(self, data, batch_size=10):
+        self.data = data
+        self.batch_size = batch_size
+        self.index = 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.index < len(self.data):
+            output = self.data[self.index: self.index + self.batch_size]
+            self.index += self.batch_size
+            return output
+        else:
+            raise StopIteration
