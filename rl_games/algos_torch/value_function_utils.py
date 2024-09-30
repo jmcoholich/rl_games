@@ -72,6 +72,8 @@ class ValueProcesser:
         self.obs_len = obs.shape[1]
 
         if self.task.progress_buf[0] >= self.start_after_n_steps:
+            # # make 2D value plot for figure
+            # self.make_2D_value_plot(obs)
             # if self.task.is_stepping_stones:
             #     return self.search_stepping_stones(obs)
             # return self.search_4D(obs)
@@ -185,6 +187,95 @@ class ValueProcesser:
 
     #     optimal_targets = torch.stack((ss0, ss1))
     #     return optimal_targets, max_idx
+
+    def make_2D_value_plot(self, obs):
+        """
+        This is the command I used to generate this
+        python -m pdb rlg_train.py --checkpoint "240928131431968672" --play --plot_values --ss_infill 0.85  --start_after 150
+        """
+        from matplotlib.lines import Line2D
+
+        # generate a dense grid for 2D values
+        output = []
+        env = 0
+        orig_obs = obs[env].clone()
+        dim = 256
+        grid = torch.linspace(-0.3, 0.3, dim, device=self.device)
+        orig_footstep_obs = orig_obs[self.start_idx:self.start_idx + 8]
+        foot_idcs = self.fg.get_footstep_idcs(self.fg.current_footstep)[env]
+        prev_targets = self.fg.footsteps[env, self.fg.current_footstep[env] - 2]
+        temp = torch.cartesian_prod(
+            grid + prev_targets[0, 0] - self.task.foot_center_pos[env, foot_idcs[0], 0],  # foot 0  x
+            grid + prev_targets[0, 1] - self.task.foot_center_pos[env, foot_idcs[0], 1],  # foot 0  y
+            # grid + prev_targets[1, 0] - self.task.foot_center_pos[env, foot_idcs[1], 0],  # foot 1  x
+            # grid + prev_targets[1, 1] - self.task.foot_center_pos[env, foot_idcs[1], 1],  # foot 1  y
+            )
+        # yaw = self.task.base_euler[env, 2]
+        # rot_mat = batch_z_2D_rot_mat(-yaw)
+        # temp[:, 0:2] = (rot_mat @ temp[:, 0:2].unsqueeze(-1)).squeeze(-1)
+        # temp[:, 2:4] = (rot_mat @ temp[:, 2:4].unsqueeze(-1)).squeeze(-1)
+        # footstep_obs = torch.zeros(2, device=self.device)
+        # if foot_idcs[0] == 1:  # idcs are [1, 2] These are the idcs being optimized over
+        #     assert foot_idcs[1] == 2
+        #     footstep_obs[:, 0] = orig_footstep_obs[0]
+        #     footstep_obs[:, 1] = orig_footstep_obs[1]
+        #     footstep_obs[:, 2] = temp[:, 0]
+        #     footstep_obs[:, 3] = temp[:, 1]
+        #     footstep_obs[:, 4] = temp[:, 2]
+        #     footstep_obs[:, 5] = temp[:, 3]
+        #     footstep_obs[:, 6] = orig_footstep_obs[6]
+        #     footstep_obs[:, 7] = orig_footstep_obs[7]
+        # elif foot_idcs[0] == 0:
+        #     assert foot_idcs[1] == 3
+        #     footstep_obs[:, 0] = temp[:, 0]
+        #     footstep_obs[:, 1] = temp[:, 1]
+        #     footstep_obs[:, 2] = orig_footstep_obs[2]
+        #     footstep_obs[:, 3] = orig_footstep_obs[3]
+        #     footstep_obs[:, 4] = orig_footstep_obs[4]
+        #     footstep_obs[:, 5] = orig_footstep_obs[5]
+        #     footstep_obs[:, 6] = temp[:, 2]
+        #     footstep_obs[:, 7] = temp[:, 3]
+        # else:
+        #     raise ValueError
+        obs = torch.zeros(temp.shape[0], orig_obs.shape[0], device=self.device)
+        obs[:] = orig_obs
+        obs[:, self.start_idx:self.start_idx + 2] = temp
+
+        values = self.get_values(obs)
+        values = values.view(dim, dim).detach().cpu().numpy()
+        plt.imshow(values, interpolation='nearest')
+        plt.xlabel("x-Distance from Last Target (m)")
+        plt.ylabel("y-Distance from Last Target (m)")
+        # scale axis so that they are in meters from -0.3 to 0.3.
+        # make sure each tick value only displays 2 decimal places
+        plt.xticks(np.arange(0, dim, step=dim // 5),
+                     [f"{val:.2f}" for val in grid[::dim // 5].cpu().numpy()])
+        plt.yticks(np.arange(0, dim, step=dim // 5),
+                        [f"{val:.2f}" for val in grid[::dim // 5].cpu().numpy()])
+        # make thick gridlines
+        # plt.grid(which='major', color='k', linestyle='-', linewidth=2)
+        # add black dots on a grid of 0.1m
+        points = torch.cartesian_prod(
+            torch.linspace(dim//6, dim - dim//6, 3, device=self.device),
+            torch.linspace(dim//6, dim - dim//6, 3, device=self.device)
+        )
+        plt.scatter(points[:, 1].cpu().numpy(), points[:, 0].cpu().numpy(), color='black', label="Grid Search Point")
+        # put a star on the max value point
+        max_idx = (values == values.max()).nonzero()
+        plt.scatter(max_idx[1], max_idx[0], color='red', marker='*', label="Optimal Next Target")
+        plt.title("Footstep Target Value Surface")
+        # add a custom legend entry
+        # Add a custom legend entry for "Gradient Ascent Step"
+        custom_legend = [
+            Line2D([0], [0], marker='o', linestyle='None', color='w', markerfacecolor='white', alpha=0.1, markersize=10, label="Gradient Ascent Step"),
+            Line2D([0], [0], marker='o', linestyle='None', color='black', markersize=10, label="Grid Search Point"),
+            Line2D([0], [0], marker='*', linestyle='None', color='red', markersize=10, label="Optimal Next Target")
+        ]
+
+        plt.legend(handles=custom_legend)
+        # plt.legend()
+        plt.show()
+
     def gd_8D(self, obs):
 
         # init sgd optimizer
@@ -210,8 +301,8 @@ class ValueProcesser:
             # print()
             # print()
             # print()
-        print(loss)
-        breakpoint()
+        # print(loss)
+        # breakpoint()
         # set footstep targets
         # for i in range(0, 8, 2):
         #     print("norm", self.params[:, i:i+2].norm(dim=1).cpu().item())
@@ -426,22 +517,22 @@ class ValueProcesser:
         foot_idcs = self.fg.get_footstep_idcs(self.fg.current_footstep - 1)
         prev_targets = self.fg.footsteps[ea, self.fg.current_footstep - 1]
 
-        test_obs[ea, :, :, :, :, :, :, :, :, self.start_idx + foot_idcs[:, 0] * p] = \
+        test_obs[ea, :, :, :, :, :, :, :, :, self.start_idx + 8 + 1] = \
             2 * self.grid.view(1, 1, 1, 1, 1, self.grid_points, 1, 1, 1) \
             + prev_targets[:, 0, 0].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1) \
             - self.task.foot_center_pos[ea, foot_idcs[:, 0], 0].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1)
 
-        test_obs[ea, :, :, :, :, :, :, :, :, self.start_idx + foot_idcs[:, 0] * p + 1] = \
+        test_obs[ea, :, :, :, :, :, :, :, :, self.start_idx + 8 + 2] = \
             2 * self.grid.view(1, 1, 1, 1, 1, 1, self.grid_points, 1, 1) \
             + prev_targets[:, 0, 1].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1) \
             - self.task.foot_center_pos[ea, foot_idcs[:, 0], 1].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1)
 
-        test_obs[ea, :, :, :, :, :, :, :, :, self.start_idx + foot_idcs[:, 1] * p] = \
+        test_obs[ea, :, :, :, :, :, :, :, :, self.start_idx + 8 + 3] = \
             2 * self.grid.view(1, 1, 1, 1, 1, 1, 1, self.grid_points, 1) \
             + prev_targets[:, 1, 0].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1) \
             - self.task.foot_center_pos[ea, foot_idcs[:, 1], 0].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1)
 
-        test_obs[ea, :, :, :, :, :, :, :, :, self.start_idx + foot_idcs[:, 1] * p + 1] = \
+        test_obs[ea, :, :, :, :, :, :, :, :, self.start_idx + 8 + 4] = \
             2 * self.grid.view(1, 1, 1, 1, 1, 1, 1, 1, self.grid_points) \
             + prev_targets[:, 1, 1].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1) \
             - self.task.foot_center_pos[ea, foot_idcs[:, 1], 1].view(n_env, 1, 1, 1, 1, 1, 1, 1, 1)

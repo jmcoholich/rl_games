@@ -79,6 +79,8 @@ def load_checkpoint(filename, ws, device):
         # ssh_client.exec_command('cd hutter_kostrikov; cd trained_models')
         sftp_client = ssh_client.open_sftp()
         path = os.path.join('quadruped/isaacgym/python/rlgpu/nn', filename, 'Aliengo.pth')
+        if ws == 7:
+            path = os.path.join('/coc/testnvme/jcoholich3/', path)
         remote_file = sftp_client.open(path, 'rb')
         state = torch.load(remote_file, map_location=device)
     print('Agent Loaded\n\n')
