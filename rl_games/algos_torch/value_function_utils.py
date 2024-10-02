@@ -1014,9 +1014,9 @@ class ValueProcesser:
 
             foot_idcs = self.fg.get_footstep_idcs(self.fg.current_footstep)
 
-            rot_mat = batch_z_2D_rot_mat(self.task.base_euler[:, 2]).view(self.num_envs, 1, 2, 2)
             rot_batch_obs = batch_obs.clone()
             for i in range(self.num_envs):
+                rot_mat = batch_z_2D_rot_mat(self.task.base_euler[i, 2]).view(1, 2, 2)
                 rot_batch_obs[i, :, si + foot_idcs[i, 0] * 2: si + foot_idcs[i, 0] * 2 + 2] = (rot_mat @ rot_batch_obs[i, :, si + foot_idcs[i, 0] * 2: si + foot_idcs[i, 0] * 2 + 2].unsqueeze(-1)).squeeze(-1)
 
                 rot_batch_obs[i, :, si + foot_idcs[i, 1] * 2: si + foot_idcs[i, 1] * 2 + 2] = (rot_mat @ rot_batch_obs[i, :, si + foot_idcs[i, 1] * 2: si + foot_idcs[i, 1] * 2 + 2].unsqueeze(-1)).squeeze(-1)
