@@ -1016,9 +1016,10 @@ class ValueProcesser:
 
             rot_mat = batch_z_2D_rot_mat(self.task.base_euler[:, 2]).view(self.num_envs, 1, 2, 2)
             rot_batch_obs = batch_obs.clone()
-            rot_batch_obs[ea, :, si + foot_idcs[:, 0] * 2: si + foot_idcs[:, 0] * 2 + 2] = (rot_mat @ rot_batch_obs[ea, :, si + foot_idcs[:, 0] * 2: si + foot_idcs[:, 0] * 2 + 2].unsqueeze(-1)).squeeze(-1)
+            for i in range(self.num_envs):
+                rot_batch_obs[i, :, si + foot_idcs[i, 0] * 2: si + foot_idcs[i, 0] * 2 + 2] = (rot_mat @ rot_batch_obs[i, :, si + foot_idcs[i, 0] * 2: si + foot_idcs[i, 0] * 2 + 2].unsqueeze(-1)).squeeze(-1)
 
-            rot_batch_obs[ea, :, si + foot_idcs[:, 1] * 2: si + foot_idcs[:, 1] * 2 + 2] = (rot_mat @ rot_batch_obs[ea, :, si + foot_idcs[:, 1] * 2: si + foot_idcs[:, 1] * 2 + 2].unsqueeze(-1)).squeeze(-1)
+                rot_batch_obs[i, :, si + foot_idcs[i, 1] * 2: si + foot_idcs[i, 1] * 2 + 2] = (rot_mat @ rot_batch_obs[i, :, si + foot_idcs[i, 1] * 2: si + foot_idcs[i, 1] * 2 + 2].unsqueeze(-1)).squeeze(-1)
 
             # these are proposed target locations
             foot0_x = rot_batch_obs[ea, :, si + foot_idcs[:, 0] * 2] + (self.task.foot_center_pos[ea, foot_idcs[:, 0], 0] - self.fg.footsteps[ea, self.fg.current_footstep - 2, 0, 0]).view(self.num_envs, 1)
