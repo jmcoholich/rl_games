@@ -2,6 +2,9 @@ from os import stat_result
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import os
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+import sys
 
 from tasks.aliengo_utils.utils import batch_z_2D_rot_mat
 
@@ -64,36 +67,133 @@ class ValueProcesser:
         if self.task.is_stepping_stones:
             self.stone_pos = self.task.stepping_stones.stone_pos[0]
 
+        # start a threadpool if saving images
+        if self.task.args.save_images:
+            self.pool = ProcessPoolExecutor()
+
     def __call__(self, obs):
-        # if self.env.task.progress_buf[0] % 500000 != 0:
-        #     return
+        if self.task.old_progress_buf[0] > 10 and self.task.old_reset_buf[0]:
+            # wait for all processes to finish
+            self.pool.shutdown(wait=True)
+            # for future in self.futures:
+            #     future.result()
+            sys.exit()
+
         if self.task.progress_buf[0] == 0:
             return obs
-        # assert obs.shape[0] == 1
 
         self.obs_len = obs.shape[1]
 
+        if self.task.args.save_images:
+            self.generate_plot_frames(obs)
         if self.task.progress_buf[0] >= self.start_after_n_steps:
-            # run every 10 steps
-            # if self.task.progress_buf[0] % 5 != 0:
-            #     return obs
-            # # make 2D value plot for figure
             # self.make_2D_value_plot(obs)
-            # if self.task.is_stepping_stones:
-            #     return self.search_stepping_stones(obs)
-            # return self.search_4D(obs)
             return self.gd_8D(obs)
-            # return self.search_8D(obs)
         else:
             return obs
-            # self.four_feet_optim(obs)
-            # self.diag_feet_optim(obs)
 
-            # if self.optim_targets:
-            #     raise NotImplementedError
-            #     footstep_obs = obs[0, self.start_idx:self.start_idx + 12]
-            #     self.player.set_new_footstep(footstep_obs)
+    def generate_plot_frames(self, obs):
+        # do one 2d grid at a time
+        env = 0
+        n = 100
+        grid = torch.linspace(-self.box_len, self.box_len,
+                               n, device=self.device)
+        orig_obs = obs[env].clone()
+        orig_footstep_obs = orig_obs[self.start_idx:self.start_idx + 12]
+        foot_idcs = self.fg.get_footstep_idcs(self.fg.current_footstep)[env]
+        next_foot_idcs = self.fg.get_footstep_idcs(self.fg.current_footstep + 1)[env]
+        prev_targets = self.fg.footsteps[env, self.fg.current_footstep[env] - 2]
+        next_prev_targets = self.fg.footsteps[env, self.fg.current_footstep[env] - 1]
+        # prev_targets = self.fg.footsteps[env, self.fg.current_footstep[env]]
+        # next_prev_targets = self.fg.footsteps[env, self.fg.current_footstep[env] + 1]
+        temp = torch.stack([
+            torch.cartesian_prod(
+            grid + prev_targets[0, 0] - self.task.foot_center_pos[env, foot_idcs[0], 0],  # foot 0  x
+            self.grid_y_factor * grid + prev_targets[0, 1] - self.task.foot_center_pos[env, foot_idcs[0], 1],  # foot 0  y
+            ),
+            torch.cartesian_prod(
+            grid + prev_targets[1, 0] - self.task.foot_center_pos[env, foot_idcs[1], 0],  # foot 1  x
+            self.grid_y_factor * grid + prev_targets[1, 1] - self.task.foot_center_pos[env, foot_idcs[1], 1],  # foot 1  y
+            ),
+            torch.cartesian_prod(
+            grid * self.grid_dialation + next_prev_targets[0, 0] - self.task.foot_center_pos[env, next_foot_idcs[0], 0],
+            self.grid_y_factor * grid * self.grid_dialation + next_prev_targets[0, 1] - self.task.foot_center_pos[env, next_foot_idcs[0], 1],
+            ),
+            torch.cartesian_prod(
+            grid * self.grid_dialation + next_prev_targets[1, 0] - self.task.foot_center_pos[env, next_foot_idcs[1], 0],
+            self.grid_y_factor * grid * self.grid_dialation + next_prev_targets[1, 1] - self.task.foot_center_pos[env, next_foot_idcs[1], 1],
+            ),
+        ])
+        yaw = self.task.base_euler[env, 2]
+        rot_mat = batch_z_2D_rot_mat(-yaw)
+        for i in range(4):
+            temp[i] = (rot_mat @ temp[i].unsqueeze(-1)).squeeze(-1)
+        footstep_obs = orig_footstep_obs.tile(n * n * 4, 1)
+        if foot_idcs[0] == 1:  # idcs are [1, 2] These are the idcs being optimized over
+            assert foot_idcs[1] == 2
+            # footstep_obs[:, 0] = orig_footstep_obs[0]
+            # footstep_obs[:, 1] = orig_footstep_obs[1]
+            footstep_obs[:n*n, 2] = temp[0, :, 0]
+            footstep_obs[:n*n, 3] = temp[0, :, 1]
+            footstep_obs[n*n:2*n*n, 4] = temp[1, :, 0]
+            footstep_obs[n*n:2*n*n, 5] = temp[1, :, 1]
+            # footstep_obs[:, 6] = orig_footstep_obs[6]
+            # footstep_obs[:, 7] = orig_footstep_obs[7]
+        elif foot_idcs[0] == 0:
+            assert foot_idcs[1] == 3
+            footstep_obs[:n*n, 0] = temp[0, :, 0]
+            footstep_obs[:n*n, 1] = temp[0, :, 1]
+            # footstep_obs[:, 2] = orig_footstep_obs[2]
+            # footstep_obs[:, 3] = orig_footstep_obs[3]
+            # footstep_obs[:, 4] = orig_footstep_obs[4]
+            # footstep_obs[:, 5] = orig_footstep_obs[5]
+            footstep_obs[n*n:n*n * 2, 6] = temp[1, :, 0]
+            footstep_obs[n*n:n*n*2, 7] = temp[1, :, 1]
+        else:
+            raise ValueError
+        # footstep_obs[:, 8:12] = temp[:, 4:]
+        footstep_obs[2*n*n:3*n*n, 8] = temp[2, :, 0]
+        footstep_obs[2*n*n:3*n*n, 9] = temp[2, :, 1]
+        footstep_obs[3*n*n:4*n*n, 10] = temp[3, :, 0]
+        footstep_obs[3*n*n:4*n*n, 11] = temp[3, :, 1]
+        new_obs = torch.zeros(n*n*4, orig_obs.shape[0], device=self.device)
+        new_obs[:] = orig_obs
+        new_obs[:, self.start_idx:self.start_idx + 12] = footstep_obs
+        new_obs = new_obs.clamp(-5.0, 5.0)
 
+        values = self.get_values(new_obs)
+        values = values.view(4, n, n).detach().cpu().numpy()
+
+        # # plot subplot heatmaps
+        # fig, axs = plt.subplots(2, 2, figsize=(10, 10))
+        # for i in range(4):
+        #     ax = axs[i // 2, i % 2]
+        #     ax.imshow(values[i], interpolation='nearest')
+        #     ax.set_title(f"{self.foot_names[i]}")
+        #     ax.set_xticks(np.arange(0, n, step=n // 5))
+        #     ax.set_yticks(np.arange(0, n, step=n // 5))
+        #     ax.set_xticklabels([f"{val:.2f}" for val in grid[::n // 5].cpu().numpy()])
+        #     ax.set_yticklabels([f"{val:.2f}" for val in grid[::n // 5].cpu().numpy()])
+        #     ax.grid(which='major', color='k', linestyle='-', linewidth=2)
+        #     # ax.scatter(n//2, n//2, color='red', marker='*', label="Optimal Next Target")
+        # plt.show()
+
+        # save each heatmap as a frame
+        foot_names = ["FL", "FR", "RL", "RR"]
+        if foot_idcs[0] == 1:
+            plot_foot_idcs = [1, 2, 0, 3]
+        else:
+            plot_foot_idcs = [0, 3, 1, 2]
+
+        # normalize all values by same color scale
+        max_val = values.max()
+        min_val = values.min()
+        grid = grid.cpu().numpy()
+        for i in range(4):
+            path = os.path.join(self.task.img_dir, f"{foot_names[plot_foot_idcs[i]]}-frame-{self.task.progress_buf[0]:04}.png")
+            self.pool.submit(save_fig, values[i], min_val, max_val, path, n, grid, foot_names[plot_foot_idcs[i]])
+            # self.futures.append(temp)
+            # save_fig(values[i], min_val, max_val, path, n, grid, foot_names[plot_foot_idcs[i]])
 
     def make_2D_value_plot(self, obs):
         """
@@ -213,20 +313,8 @@ class ValueProcesser:
             test_obs = self.generate_8D_test_obs(obs, self.params)
             loss = self.loss_8D(test_obs)
             loss.backward(retain_graph=True)
-            # print("after backward", params.grad)
             self.optimizer.step()
-            # print(f"iter {i}, loss {loss.item()}, params {test_obs[0, self.start_idx: self.start_idx + 12].detach().cpu().numpy()}")
-            # print(params)
-            # print()
-            # print()
-            # print()
         self.params = self.params.detach()
-        # print(loss)
-        # breakpoint()
-        # set footstep targets
-        # for i in range(0, 8, 2):
-        #     print("norm", self.params[:, i:i+2].norm(dim=1).cpu().item())
-        # print()
         yaws = self.task.base_euler[:, 2]
         rot_mats = batch_z_2D_rot_mat(yaws)
         curr_footstep_idcs = self.fg.get_footstep_idcs(self.fg.current_footstep)
@@ -234,6 +322,8 @@ class ValueProcesser:
 
         if self.random_footsteps:
             rand_vals = (torch.rand(4, self.num_envs, 2, device=self.device) * 2 - 1) * self.box_len
+            rand_vals[2:] *= self.grid_dialation
+            rand_vals[:, :, 1] *= self.grid_y_factor
             curr_opt_tgt_foot0 = rand_vals[0] + self.task.foot_center_pos[self.env_arange, curr_footstep_idcs[:, 0], :2]
 
             curr_opt_tgt_foot1 = rand_vals[1] + self.task.foot_center_pos[self.env_arange, curr_footstep_idcs[:, 1], :2]
@@ -261,11 +351,6 @@ class ValueProcesser:
         self.fg.plot_footstep_targets(current_only=True)
         if self.optmize_current_step:
             output_obs = self.task.observe(recalculating_obs=True).clamp(-5.0, 5.0)
-            # print(self.fg.get_footstep_idcs(self.fg.current_footstep))
-            # print(self.params)
-            # print(output_obs[:, self.start_idx: self.start_idx + 12])
-            # print()
-            # breakpoint()
         return output_obs
 
     def loss_8D(self, obs):
@@ -302,14 +387,6 @@ class ValueProcesser:
         """
         output_obs = obs.clone()
         test_obs = self.generate_8D_test_obs_cart_prod(obs).view([self.num_envs] + [self.grid_points] * 8 + [self.obs_len])
-        # fourd_test = self.generate_4D_test_obs(obs)
-        # test_obs = self.generate_8D_test_obs_cart_prod(obs)
-        # print("max_error", (output_obs.view(self.num_envs, 1, -1) - test_obs.view(self.num_envs, -1, self.obs_len)).abs().max())
-        # print("max_error", (output_obs.view(self.num_envs, 1, -1)[:, :, :self.start_idx] - test_obs.view(self.num_envs, -1, self.obs_len)[:, :, :self.start_idx]).abs().max())
-        # print("max_error", (output_obs.view(self.num_envs, 1, -1)[:, :, self.start_idx + 12:] - test_obs.view(self.num_envs, -1, self.obs_len)[:, :, self.start_idx + 12:]).abs().max())
-        # print("max_error", (output_obs.view(self.num_envs, 1, -1)[:, :, self.start_idx: self.start_idx + 12:] - test_obs.view(self.num_envs, -1, self.obs_len)[:, :, self.start_idx: self.start_idx + 12:]).abs())
-        # print("max_error idx ", (output_obs.view(self.num_envs, 1, -1)[:, :, self.start_idx: self.start_idx + 12:] - test_obs.view(self.num_envs, -1, self.obs_len)[:, :, self.start_idx: self.start_idx + 12:]).abs().argmax())
-        # breakpoint()
         values = self.get_values(
             test_obs.clone().view(self.num_envs * self.grid_points**8, self.obs_len))
         values = values.view([self.num_envs] + [self.grid_points] * 8)
@@ -328,93 +405,45 @@ class ValueProcesser:
                 outputs.append(output)
             return torch.stack(outputs)
 
-            # apply first order low-pass filter
-
-        #     # self.fg.footsteps[self.env_arange, self.fg.current_footstep] = 0.1 * optimal_targets + 0.9 * self.fg.footsteps[self.env_arange, self.fg.current_footstep]
-        #     self.fg.footsteps[self.env_arange, self.fg.current_footstep] = optimal_targets
-        #     self.fg.footsteps[self.env_arange, self.fg.current_footstep + 1] = optimal_next_next_targets
-        #     self.fg.plot_footstep_targets(current_only=True)
-        #     if self.optmize_current_step:
-        #         output_obs = self.task.observe(recalculating_obs=True)
-
-        # if self.make_plots or self.save_video_frames:
-        #     self.plot_4D_values(values[0], max_idx[0])
-        # return output_obs
-
-    def search_4D(self, obs):
-        """
-        I want to also modify the footsteps in place.
-        dim 0: foot 0  x
-        dim 1: foot 0  y
-        dim 2: foot 1  x
-        dim 3: foot 1  y
-        """
-        output_obs = obs.clone()
-        test_obs = self.generate_4D_test_obs(obs)
-        # new = test_obs.view(self.task.num_envs, -1, test_obs.shape[-1])
-        # test_obs = self.generate_4D_test_obs_cart_prod(obs)
-        # new2 = []
-        # for batch in test_obs:
-        #     new2.append(batch)
-        # breakpoint()
-
-        # test_obs_old = self.generate_4D_test_obs_old(obs, 0)
-
-        # for i in range(self.num_envs):
-        #     test_obs_old = self.generate_4D_test_obs_old(obs, i)
-        #     same = (test_obs_old == test_obs[i]).all()
-        #     print(same.item())
-        #     assert same
-
-        # import sys; sys.exit()
+    # def search_4D(self, obs):
+    #     """
+    #     I want to also modify the footsteps in place.
+    #     dim 0: foot 0  x
+    #     dim 1: foot 0  y
+    #     dim 2: foot 1  x
+    #     dim 3: foot 1  y
+    #     """
+    #     output_obs = obs.clone()
+    #     test_obs = self.generate_4D_test_obs(obs)
 
 
-        values = self.get_values(
-            test_obs.view(self.num_envs * self.grid_points**4, self.obs_len))
-        values = values.view([self.num_envs] + [self.grid_points] * 4)
-        print(-values.max())
-        breakpoint()
+    #     values = self.get_values(
+    #         test_obs.view(self.num_envs * self.grid_points**4, self.obs_len))
+    #     values = values.view([self.num_envs] + [self.grid_points] * 4)
+    #     # print(-values.max())
+    #     # breakpoint()
 
-        # values_old = self.get_values(
-        #     test_obs_old.view(self.grid_points**4, self.obs_len))
-        # values_old = values_old.view([self.grid_points] * 4)
+    #     if self.optim_targets:
+    #         values = self.adjust_4D_values(values)
+    #         optimal_targets, max_idx = self.get_optimal_targets_from_4D(values)
 
-        # same = (values == values_old).all()
-        # print(same)
-        # assert same
-        # import sys; sys.exit()
+    #         if NEW_THING:
+    #             yaw = batch_z_2D_rot_mat(-self.task.base_euler[:,2]).view(self.num_envs, 1, 2, 2)
+    #             optimal_targets = (yaw @ optimal_targets.unsqueeze(-1)).squeeze(-1)
+    #         if PLOT and self.task.progress_buf[0] % PLOT_AFTER == 0:
+    #             plt.figure("world")
+    #             env = 0
+    #             plt.scatter(-optimal_targets[env, 0, 1].cpu().numpy(), optimal_targets[env, 0, 0].cpu().numpy(), facecolors='none', edgecolors='c')
+    #             plt.scatter(-optimal_targets[env, 1, 1].cpu().numpy(), optimal_targets[env, 1, 0].cpu().numpy(), facecolors='none', edgecolors='c')
+    #             plt.show()
+    #         self.fg.footsteps[self.env_arange, self.fg.current_footstep] = optimal_targets
+    #         self.fg.plot_footstep_targets(current_only=True)
+    #         if self.optmize_current_step:
+    #             output_obs = self.task.observe(recalculating_obs=True).clamp(-5.0, 5.0)
 
-
-        if self.optim_targets:
-            values = self.adjust_4D_values(values)
-            optimal_targets, max_idx = self.get_optimal_targets_from_4D(values)
-
-            # for i in range(self.num_envs):
-            #     old_opt_tar, old_max_idx = self.get_optimal_targets_from_4D_old(values, i)
-            #     same = (optimal_targets[i] == old_opt_tar).all() and (max_idx[i] == old_max_idx).all()
-            #     print(same.item())
-            #     assert same
-
-            # apply first order low-pass filter
-
-            # self.fg.footsteps[self.env_arange, self.fg.current_footstep] = 0.1 * optimal_targets + 0.9 * self.fg.footsteps[self.env_arange, self.fg.current_footstep]
-            if NEW_THING:
-                yaw = batch_z_2D_rot_mat(-self.task.base_euler[:,2]).view(self.num_envs, 1, 2, 2)
-                optimal_targets = (yaw @ optimal_targets.unsqueeze(-1)).squeeze(-1)
-            if PLOT and self.task.progress_buf[0] % PLOT_AFTER == 0:
-                plt.figure("world")
-                env = 0
-                plt.scatter(-optimal_targets[env, 0, 1].cpu().numpy(), optimal_targets[env, 0, 0].cpu().numpy(), facecolors='none', edgecolors='c')
-                plt.scatter(-optimal_targets[env, 1, 1].cpu().numpy(), optimal_targets[env, 1, 0].cpu().numpy(), facecolors='none', edgecolors='c')
-                plt.show()
-            self.fg.footsteps[self.env_arange, self.fg.current_footstep] = optimal_targets
-            self.fg.plot_footstep_targets(current_only=True)
-            if self.optmize_current_step:
-                output_obs = self.task.observe(recalculating_obs=True).clamp(-5.0, 5.0)
-
-        if self.make_plots or self.save_video_frames:
-            self.plot_4D_values(values[0], max_idx[0])
-        return output_obs
+    #     if self.make_plots or self.save_video_frames:
+    #         self.plot_4D_values(values[0], max_idx[0])
+    #     return output_obs
 
 
     def generate_8D_test_obs_grid(self, obs):
@@ -498,56 +527,56 @@ class ValueProcesser:
 
         return test_obs
 
-    def generate_4D_test_obs_cart_prod(self, obs):
-        # I don't expect to be doing this for many envs at a time, so I will just loop over envs
-        # unfortunately there is no batched version of cartesian_prod, so I'm using a for loop
+    # def generate_4D_test_obs_cart_prod(self, obs):
+    #     # I don't expect to be doing this for many envs at a time, so I will just loop over envs
+    #     # unfortunately there is no batched version of cartesian_prod, so I'm using a for loop
 
-        # TODO for now just return the same thing as generate_4D_test_obs. After testing this, switch to returning a memory-efficient iterator
-        output = []
-        for i in range(self.num_envs):
-            orig_obs = obs[i].clone()
-            orig_footstep_obs = orig_obs[self.start_idx:self.start_idx + 8]
-            foot_idcs = self.fg.get_footstep_idcs(self.fg.current_footstep)[i]
-            prev_targets = self.fg.footsteps[i, self.fg.current_footstep[i] - 2]
-            temp = torch.cartesian_prod(
-                self.grid + prev_targets[0, 0] - self.task.foot_center_pos[i, foot_idcs[0], 0],  # foot 0  x
-                self.grid + prev_targets[0, 1] - self.task.foot_center_pos[i, foot_idcs[0], 1],  # foot 0  y
-                self.grid + prev_targets[1, 0] - self.task.foot_center_pos[i, foot_idcs[1], 0],  # foot 1  x
-                self.grid + prev_targets[1, 1] - self.task.foot_center_pos[i, foot_idcs[1], 1],  # foot 1  y
-                )
-            yaw = self.task.base_euler[i, 2]
-            rot_mat = batch_z_2D_rot_mat(-yaw)
-            temp[:, 0:2] = (rot_mat @ temp[:, 0:2].unsqueeze(-1)).squeeze(-1)
-            temp[:, 2:4] = (rot_mat @ temp[:, 2:4].unsqueeze(-1)).squeeze(-1)
-            footstep_obs = torch.zeros(temp.shape[0], 8, device=self.device)
-            if foot_idcs[0] == 1:  # idcs are [1, 2] These are the idcs being optimized over
-                assert foot_idcs[1] == 2
-                footstep_obs[:, 0] = orig_footstep_obs[0]
-                footstep_obs[:, 1] = orig_footstep_obs[1]
-                footstep_obs[:, 2] = temp[:, 0]
-                footstep_obs[:, 3] = temp[:, 1]
-                footstep_obs[:, 4] = temp[:, 2]
-                footstep_obs[:, 5] = temp[:, 3]
-                footstep_obs[:, 6] = orig_footstep_obs[6]
-                footstep_obs[:, 7] = orig_footstep_obs[7]
-            elif foot_idcs[0] == 0:
-                assert foot_idcs[1] == 3
-                footstep_obs[:, 0] = temp[:, 0]
-                footstep_obs[:, 1] = temp[:, 1]
-                footstep_obs[:, 2] = orig_footstep_obs[2]
-                footstep_obs[:, 3] = orig_footstep_obs[3]
-                footstep_obs[:, 4] = orig_footstep_obs[4]
-                footstep_obs[:, 5] = orig_footstep_obs[5]
-                footstep_obs[:, 6] = temp[:, 2]
-                footstep_obs[:, 7] = temp[:, 3]
-            else:
-                raise ValueError
-            obs = torch.zeros(temp.shape[0], orig_obs.shape[0], device=self.device)
-            obs[:] = orig_obs
-            obs[:, self.start_idx:self.start_idx + 8] = footstep_obs
-            output.append(obs)
-            breakpoint()
-        return MyIterator(torch.stack(output))
+    #     # TODO for now just return the same thing as generate_4D_test_obs. After testing this, switch to returning a memory-efficient iterator
+    #     output = []
+    #     for i in range(self.num_envs):
+    #         orig_obs = obs[i].clone()
+    #         orig_footstep_obs = orig_obs[self.start_idx:self.start_idx + 8]
+    #         foot_idcs = self.fg.get_footstep_idcs(self.fg.current_footstep)[i]
+    #         prev_targets = self.fg.footsteps[i, self.fg.current_footstep[i] - 2]
+    #         temp = torch.cartesian_prod(
+    #             self.grid + prev_targets[0, 0] - self.task.foot_center_pos[i, foot_idcs[0], 0],  # foot 0  x
+    #             self.grid + prev_targets[0, 1] - self.task.foot_center_pos[i, foot_idcs[0], 1],  # foot 0  y
+    #             self.grid + prev_targets[1, 0] - self.task.foot_center_pos[i, foot_idcs[1], 0],  # foot 1  x
+    #             self.grid + prev_targets[1, 1] - self.task.foot_center_pos[i, foot_idcs[1], 1],  # foot 1  y
+    #             )
+    #         yaw = self.task.base_euler[i, 2]
+    #         rot_mat = batch_z_2D_rot_mat(-yaw)
+    #         temp[:, 0:2] = (rot_mat @ temp[:, 0:2].unsqueeze(-1)).squeeze(-1)
+    #         temp[:, 2:4] = (rot_mat @ temp[:, 2:4].unsqueeze(-1)).squeeze(-1)
+    #         footstep_obs = torch.zeros(temp.shape[0], 8, device=self.device)
+    #         if foot_idcs[0] == 1:  # idcs are [1, 2] These are the idcs being optimized over
+    #             assert foot_idcs[1] == 2
+    #             footstep_obs[:, 0] = orig_footstep_obs[0]
+    #             footstep_obs[:, 1] = orig_footstep_obs[1]
+    #             footstep_obs[:, 2] = temp[:, 0]
+    #             footstep_obs[:, 3] = temp[:, 1]
+    #             footstep_obs[:, 4] = temp[:, 2]
+    #             footstep_obs[:, 5] = temp[:, 3]
+    #             footstep_obs[:, 6] = orig_footstep_obs[6]
+    #             footstep_obs[:, 7] = orig_footstep_obs[7]
+    #         elif foot_idcs[0] == 0:
+    #             assert foot_idcs[1] == 3
+    #             footstep_obs[:, 0] = temp[:, 0]
+    #             footstep_obs[:, 1] = temp[:, 1]
+    #             footstep_obs[:, 2] = orig_footstep_obs[2]
+    #             footstep_obs[:, 3] = orig_footstep_obs[3]
+    #             footstep_obs[:, 4] = orig_footstep_obs[4]
+    #             footstep_obs[:, 5] = orig_footstep_obs[5]
+    #             footstep_obs[:, 6] = temp[:, 2]
+    #             footstep_obs[:, 7] = temp[:, 3]
+    #         else:
+    #             raise ValueError
+    #         obs = torch.zeros(temp.shape[0], orig_obs.shape[0], device=self.device)
+    #         obs[:] = orig_obs
+    #         obs[:, self.start_idx:self.start_idx + 8] = footstep_obs
+    #         output.append(obs)
+    #         breakpoint()
+    #     return MyIterator(torch.stack(output))
 
 
     def generate_8D_test_obs_cart_prod(self, obs):
@@ -613,161 +642,161 @@ class ValueProcesser:
             # breakpoint()
         return torch.stack(output).clamp(-5.0, 5.0)
 
-    def generate_4D_test_obs(self, obs):
-        """
-        dim 0: foot 0  x
-        dim 1: foot 0  y
-        dim 2: foot 1  x
-        dim 3: foot 1  y
-        """
-        p = 2  # this is the obs len per footstep target. Was previously 3
-        ea = self.env_arange
-        n_env = self.num_envs
+    # def generate_4D_test_obs(self, obs):
+    #     """
+    #     dim 0: foot 0  x
+    #     dim 1: foot 0  y
+    #     dim 2: foot 1  x
+    #     dim 3: foot 1  y
+    #     """
+    #     p = 2  # this is the obs len per footstep target. Was previously 3
+    #     ea = self.env_arange
+    #     n_env = self.num_envs
 
-        foot_idcs = self.fg.get_footstep_idcs(self.fg.current_footstep)
-        # NOTE next line will fail if executed before agent hits first targets
-        prev_targets = self.fg.footsteps[ea, self.fg.current_footstep - 2]
-        test_obs = obs.view(n_env, 1, 1, 1, 1, self.obs_len).tile([1] + [self.grid_points] * 4 + [1])
+    #     foot_idcs = self.fg.get_footstep_idcs(self.fg.current_footstep)
+    #     # NOTE next line will fail if executed before agent hits first targets
+    #     prev_targets = self.fg.footsteps[ea, self.fg.current_footstep - 2]
+    #     test_obs = obs.view(n_env, 1, 1, 1, 1, self.obs_len).tile([1] + [self.grid_points] * 4 + [1])
 
-        # generate grids centered around previous footstep targets aligned
-        # with global coordinate system
-        # TODO make sure these actually update upon assignment
-        test_obs[ea, :, :, :, :, self.start_idx + foot_idcs[:, 0] * p] = \
-            self.grid.view(1, self.grid_points, 1, 1, 1) \
-            + prev_targets[:, 0, 0].view(n_env, 1, 1, 1, 1) \
-            - self.task.foot_center_pos[ea, foot_idcs[:, 0], 0].view(n_env, 1, 1, 1, 1)
+    #     # generate grids centered around previous footstep targets aligned
+    #     # with global coordinate system
+    #     # TODO make sure these actually update upon assignment
+    #     test_obs[ea, :, :, :, :, self.start_idx + foot_idcs[:, 0] * p] = \
+    #         self.grid.view(1, self.grid_points, 1, 1, 1) \
+    #         + prev_targets[:, 0, 0].view(n_env, 1, 1, 1, 1) \
+    #         - self.task.foot_center_pos[ea, foot_idcs[:, 0], 0].view(n_env, 1, 1, 1, 1)
 
-        test_obs[ea, :, :, :, :, self.start_idx + foot_idcs[:, 0] * p + 1] = \
-            self.grid.view(1, 1, self.grid_points, 1, 1) \
-            + prev_targets[:, 0, 1].view(n_env, 1, 1, 1, 1) \
-            - self.task.foot_center_pos[ea, foot_idcs[:, 0], 1].view(n_env, 1, 1, 1, 1)
+    #     test_obs[ea, :, :, :, :, self.start_idx + foot_idcs[:, 0] * p + 1] = \
+    #         self.grid.view(1, 1, self.grid_points, 1, 1) \
+    #         + prev_targets[:, 0, 1].view(n_env, 1, 1, 1, 1) \
+    #         - self.task.foot_center_pos[ea, foot_idcs[:, 0], 1].view(n_env, 1, 1, 1, 1)
 
-        test_obs[ea, :, :, :, :, self.start_idx + foot_idcs[:, 1] * p] = \
-            self.grid.view(1, 1, 1, self.grid_points, 1) \
-            + prev_targets[:, 1, 0].view(n_env, 1, 1, 1, 1) \
-            - self.task.foot_center_pos[ea, foot_idcs[:, 1], 0].view(n_env, 1, 1, 1, 1)
+    #     test_obs[ea, :, :, :, :, self.start_idx + foot_idcs[:, 1] * p] = \
+    #         self.grid.view(1, 1, 1, self.grid_points, 1) \
+    #         + prev_targets[:, 1, 0].view(n_env, 1, 1, 1, 1) \
+    #         - self.task.foot_center_pos[ea, foot_idcs[:, 1], 0].view(n_env, 1, 1, 1, 1)
 
-        test_obs[ea, :, :, :, :, self.start_idx + foot_idcs[:, 1] * p + 1] = \
-            self.grid.view(1, 1, 1, 1, self.grid_points) \
-            + prev_targets[:, 1, 1].view(n_env, 1, 1, 1, 1) \
-            - self.task.foot_center_pos[ea, foot_idcs[:, 1], 1].view(n_env, 1, 1, 1, 1)
+    #     test_obs[ea, :, :, :, :, self.start_idx + foot_idcs[:, 1] * p + 1] = \
+    #         self.grid.view(1, 1, 1, 1, self.grid_points) \
+    #         + prev_targets[:, 1, 1].view(n_env, 1, 1, 1, 1) \
+    #         - self.task.foot_center_pos[ea, foot_idcs[:, 1], 1].view(n_env, 1, 1, 1, 1)
 
-        if PLOT and self.task.progress_buf[0] % PLOT_AFTER == 0:
-
-
-            import matplotlib.pyplot as plt
-            # global WORLD_FIG
-            # WORLD_FIG = plt.figure()
-            plt.figure("world")
-            plt.title("World frame (x is up)")
-            env = 0
-            test_obs_plt = test_obs[env].clone()
-            if NEW_THING:
-                # rotate the grid points to align with robot yaw
-                yaw = self.task.base_euler[env, 2]
-                rot_mat = batch_z_2D_rot_mat(yaw)
-                test_obs_plt[ :, :, :, :, self.start_idx + foot_idcs[env, 0] * p: self.start_idx + foot_idcs[env, 0] * p + 2] = \
-                    (rot_mat @ test_obs_plt[ :, :, :, :, self.start_idx + foot_idcs[env, 0] * p: self.start_idx + foot_idcs[env, 0] * p + 2].unsqueeze(-1)).squeeze(-1)
-                test_obs_plt[ :, :, :, :, self.start_idx + foot_idcs[env, 1] * p: self.start_idx + foot_idcs[env, 1] * p + 2] = \
-                    (rot_mat @ test_obs_plt[ :, :, :, :, self.start_idx + foot_idcs[env, 1] * p: self.start_idx + foot_idcs[env, 1] * p + 2].unsqueeze(-1)).squeeze(-1)
-            test_obs_plt = test_obs_plt.cpu().numpy()
-
-            prev_tgt_x_foot_0 = self.fg.footsteps[env, self.fg.current_footstep[env] - 2, 0, 0].cpu().numpy()
-            prev_tgt_x_foot_1 = self.fg.footsteps[env, self.fg.current_footstep[env] - 2, 1, 0].cpu().numpy()
-            prev_tgt_y_foot_0 = self.fg.footsteps[env, self.fg.current_footstep[env] - 2, 0, 1].cpu().numpy()
-            prev_tgt_y_foot_1 = self.fg.footsteps[env, self.fg.current_footstep[env] - 2, 1, 1].cpu().numpy()
-            curr_pos_x_foot_0 = self.task.foot_center_pos[env, foot_idcs[env, 0], 0].cpu().numpy()
-            curr_pos_x_foot_1 = self.task.foot_center_pos[env, foot_idcs[env, 1], 0].cpu().numpy()
-            curr_pos_y_foot_0 = self.task.foot_center_pos[env, foot_idcs[env, 0], 1].cpu().numpy()
-            curr_pos_y_foot_1 = self.task.foot_center_pos[env, foot_idcs[env, 1], 1].cpu().numpy()
+    #     if PLOT and self.task.progress_buf[0] % PLOT_AFTER == 0:
 
 
-            # plot last footstep targets (I want the axes switched so that x is "up")
-            plt.scatter(-prev_tgt_y_foot_0, prev_tgt_x_foot_0, c='r')
-            plt.annotate("prev_tgt", (-prev_tgt_y_foot_0, prev_tgt_x_foot_0))
-            plt.scatter(-prev_tgt_y_foot_1, prev_tgt_x_foot_1, c='r')
-            plt.annotate("prev_tgt", (-prev_tgt_y_foot_1, prev_tgt_x_foot_1))
+    #         import matplotlib.pyplot as plt
+    #         # global WORLD_FIG
+    #         # WORLD_FIG = plt.figure()
+    #         plt.figure("world")
+    #         plt.title("World frame (x is up)")
+    #         env = 0
+    #         test_obs_plt = test_obs[env].clone()
+    #         if NEW_THING:
+    #             # rotate the grid points to align with robot yaw
+    #             yaw = self.task.base_euler[env, 2]
+    #             rot_mat = batch_z_2D_rot_mat(yaw)
+    #             test_obs_plt[ :, :, :, :, self.start_idx + foot_idcs[env, 0] * p: self.start_idx + foot_idcs[env, 0] * p + 2] = \
+    #                 (rot_mat @ test_obs_plt[ :, :, :, :, self.start_idx + foot_idcs[env, 0] * p: self.start_idx + foot_idcs[env, 0] * p + 2].unsqueeze(-1)).squeeze(-1)
+    #             test_obs_plt[ :, :, :, :, self.start_idx + foot_idcs[env, 1] * p: self.start_idx + foot_idcs[env, 1] * p + 2] = \
+    #                 (rot_mat @ test_obs_plt[ :, :, :, :, self.start_idx + foot_idcs[env, 1] * p: self.start_idx + foot_idcs[env, 1] * p + 2].unsqueeze(-1)).squeeze(-1)
+    #         test_obs_plt = test_obs_plt.cpu().numpy()
 
-            # plot curret foot positions
-            plt.scatter(-curr_pos_y_foot_0, curr_pos_x_foot_0, c='g')
-            plt.annotate("curr_pos", (-curr_pos_y_foot_0, curr_pos_x_foot_0))
-            plt.scatter(-curr_pos_y_foot_1, curr_pos_x_foot_1, c='g')
-            plt.annotate("curr_pos", (-curr_pos_y_foot_1, curr_pos_x_foot_1))
-
-            # plot search points
-            marker_size = 10
-            plt.scatter(-(test_obs_plt[ :, :, :, :, self.start_idx + foot_idcs[env, 0] * p + 1].flatten() + curr_pos_y_foot_0),
-                        test_obs_plt[ :, :, :, :, self.start_idx + foot_idcs[env, 0] * p].flatten() + curr_pos_x_foot_0, marker='x', s=marker_size)
-            plt.scatter(-(test_obs_plt[ :, :, :, :, self.start_idx + foot_idcs[env, 1] * p + 1].flatten() + curr_pos_y_foot_1),
-                        test_obs_plt[ :, :, :, :, self.start_idx + foot_idcs[env, 1] * p].flatten() + curr_pos_x_foot_1, marker='x', s=marker_size)
-            # draw rectangle around search box. Just do previous footstep targets +- box_len
-            plt.plot(
-                [
-                -(prev_tgt_y_foot_0 - self.box_len),
-                -(prev_tgt_y_foot_0 - self.box_len),
-                -(prev_tgt_y_foot_0 + self.box_len),
-                -(prev_tgt_y_foot_0 + self.box_len),
-                -(prev_tgt_y_foot_0 - self.box_len),
-                ],
-                [prev_tgt_x_foot_0 - self.box_len,
-                prev_tgt_x_foot_0 + self.box_len,
-                prev_tgt_x_foot_0 + self.box_len,
-                prev_tgt_x_foot_0 - self.box_len,
-                prev_tgt_x_foot_0 - self.box_len],
-                c='k')
-            plt.plot([
-                -(prev_tgt_y_foot_1 - self.box_len),
-                -(prev_tgt_y_foot_1 - self.box_len),
-                -(prev_tgt_y_foot_1 + self.box_len),
-                -(prev_tgt_y_foot_1 + self.box_len),
-                -(prev_tgt_y_foot_1 - self.box_len),
-                ],
-                        [prev_tgt_x_foot_1 - self.box_len, prev_tgt_x_foot_1 + self.box_len, prev_tgt_x_foot_1 + self.box_len, prev_tgt_x_foot_1 - self.box_len, prev_tgt_x_foot_1 - self.box_len], c='k')
-            # plot an arrow at the origin pointing in robot yaw direction
-            arrow_len = 0.1
-            plt.arrow(0, 0, -arrow_len * np.sin(self.task.base_euler[env, 2].cpu().numpy()), arrow_len * np.cos(self.task.base_euler[env, 2].cpu().numpy()), head_width=0.05, head_length=0.1, fc='k', ec='k')
-            plt.axis('equal')
-            plt.grid()
+    #         prev_tgt_x_foot_0 = self.fg.footsteps[env, self.fg.current_footstep[env] - 2, 0, 0].cpu().numpy()
+    #         prev_tgt_x_foot_1 = self.fg.footsteps[env, self.fg.current_footstep[env] - 2, 1, 0].cpu().numpy()
+    #         prev_tgt_y_foot_0 = self.fg.footsteps[env, self.fg.current_footstep[env] - 2, 0, 1].cpu().numpy()
+    #         prev_tgt_y_foot_1 = self.fg.footsteps[env, self.fg.current_footstep[env] - 2, 1, 1].cpu().numpy()
+    #         curr_pos_x_foot_0 = self.task.foot_center_pos[env, foot_idcs[env, 0], 0].cpu().numpy()
+    #         curr_pos_x_foot_1 = self.task.foot_center_pos[env, foot_idcs[env, 1], 0].cpu().numpy()
+    #         curr_pos_y_foot_0 = self.task.foot_center_pos[env, foot_idcs[env, 0], 1].cpu().numpy()
+    #         curr_pos_y_foot_1 = self.task.foot_center_pos[env, foot_idcs[env, 1], 1].cpu().numpy()
 
 
+    #         # plot last footstep targets (I want the axes switched so that x is "up")
+    #         plt.scatter(-prev_tgt_y_foot_0, prev_tgt_x_foot_0, c='r')
+    #         plt.annotate("prev_tgt", (-prev_tgt_y_foot_0, prev_tgt_x_foot_0))
+    #         plt.scatter(-prev_tgt_y_foot_1, prev_tgt_x_foot_1, c='r')
+    #         plt.annotate("prev_tgt", (-prev_tgt_y_foot_1, prev_tgt_x_foot_1))
 
-        # # subtract robot feet global positions from the grid
-        # test_obs[:, :, :, :, self.start_idx + foot_idcs[0] * p] -= \
-        #     self.task.foot_center_pos[0, foot_idcs[0], 0]
-        # test_obs[:, :, :, :, self.start_idx + foot_idcs[0] * p + 1] -= \
-        #     self.task.foot_center_pos[0, foot_idcs[0], 1]
-        # test_obs[:, :, :, :, self.start_idx + foot_idcs[1] * p] -= \
-        #     self.task.foot_center_pos[0, foot_idcs[1], 0]
-        # test_obs[:, :, :, :, self.start_idx + foot_idcs[1] * p + 1] -= \
-        #     self.task.foot_center_pos[0, foot_idcs[1], 1]
+    #         # plot curret foot positions
+    #         plt.scatter(-curr_pos_y_foot_0, curr_pos_x_foot_0, c='g')
+    #         plt.annotate("curr_pos", (-curr_pos_y_foot_0, curr_pos_x_foot_0))
+    #         plt.scatter(-curr_pos_y_foot_1, curr_pos_x_foot_1, c='g')
+    #         plt.annotate("curr_pos", (-curr_pos_y_foot_1, curr_pos_x_foot_1))
 
-        # rotate to align with robot yaw
-        if not NEW_THING:
-            yaw = self.task.base_euler[:, 2]
-            rot_mat = batch_z_2D_rot_mat(-yaw).view(n_env, 1, 1, 1, 1, 2, 2)
-            ea = ea.unsqueeze(-1)
+    #         # plot search points
+    #         marker_size = 10
+    #         plt.scatter(-(test_obs_plt[ :, :, :, :, self.start_idx + foot_idcs[env, 0] * p + 1].flatten() + curr_pos_y_foot_0),
+    #                     test_obs_plt[ :, :, :, :, self.start_idx + foot_idcs[env, 0] * p].flatten() + curr_pos_x_foot_0, marker='x', s=marker_size)
+    #         plt.scatter(-(test_obs_plt[ :, :, :, :, self.start_idx + foot_idcs[env, 1] * p + 1].flatten() + curr_pos_y_foot_1),
+    #                     test_obs_plt[ :, :, :, :, self.start_idx + foot_idcs[env, 1] * p].flatten() + curr_pos_x_foot_1, marker='x', s=marker_size)
+    #         # draw rectangle around search box. Just do previous footstep targets +- box_len
+    #         plt.plot(
+    #             [
+    #             -(prev_tgt_y_foot_0 - self.box_len),
+    #             -(prev_tgt_y_foot_0 - self.box_len),
+    #             -(prev_tgt_y_foot_0 + self.box_len),
+    #             -(prev_tgt_y_foot_0 + self.box_len),
+    #             -(prev_tgt_y_foot_0 - self.box_len),
+    #             ],
+    #             [prev_tgt_x_foot_0 - self.box_len,
+    #             prev_tgt_x_foot_0 + self.box_len,
+    #             prev_tgt_x_foot_0 + self.box_len,
+    #             prev_tgt_x_foot_0 - self.box_len,
+    #             prev_tgt_x_foot_0 - self.box_len],
+    #             c='k')
+    #         plt.plot([
+    #             -(prev_tgt_y_foot_1 - self.box_len),
+    #             -(prev_tgt_y_foot_1 - self.box_len),
+    #             -(prev_tgt_y_foot_1 + self.box_len),
+    #             -(prev_tgt_y_foot_1 + self.box_len),
+    #             -(prev_tgt_y_foot_1 - self.box_len),
+    #             ],
+    #                     [prev_tgt_x_foot_1 - self.box_len, prev_tgt_x_foot_1 + self.box_len, prev_tgt_x_foot_1 + self.box_len, prev_tgt_x_foot_1 - self.box_len, prev_tgt_x_foot_1 - self.box_len], c='k')
+    #         # plot an arrow at the origin pointing in robot yaw direction
+    #         arrow_len = 0.1
+    #         plt.arrow(0, 0, -arrow_len * np.sin(self.task.base_euler[env, 2].cpu().numpy()), arrow_len * np.cos(self.task.base_euler[env, 2].cpu().numpy()), head_width=0.05, head_length=0.1, fc='k', ec='k')
+    #         plt.axis('equal')
+    #         plt.grid()
 
-            for i in range(self.num_envs):
-                rot_mat = batch_z_2D_rot_mat(-yaw[i])
-                test_obs[i, :, :, :, :, self.start_idx + foot_idcs[i, 0] * p: self.start_idx + foot_idcs[i, 0] * p + p] = \
-                    (rot_mat @ test_obs[i, :, :, :, :, self.start_idx + foot_idcs[i, 0] * p: self.start_idx + foot_idcs[i, 0] * p + p].unsqueeze(-1)).squeeze(-1)
-                test_obs[i, :, :, :, :, self.start_idx + foot_idcs[i, 1] * p: self.start_idx + foot_idcs[i, 1] * p + p] = \
-                    (rot_mat @ test_obs[i, :, :, :, :, self.start_idx + foot_idcs[i, 1] * p: self.start_idx + foot_idcs[i, 1] * p + p].unsqueeze(-1)).squeeze(-1)
-        if PLOT and self.task.progress_buf[0] % PLOT_AFTER == 0:
-            # plot the search points in the robot frame
-            # global ROBO_FIG
-            # ROBO_FIG = plt.figure()
-            plt.figure("robot")
-            plt.title("Robot frame (x is up), first foot search points")
-            marker_size = 10
-            plt.scatter(-test_obs[env, :, :, :, :, self.start_idx + foot_idcs[env, 0] * p + 1].view(-1).cpu().numpy(),
-                        test_obs[env, :, :, :, :, self.start_idx + foot_idcs[env, 0] * p].view(-1).cpu().numpy(), marker='x', s=marker_size)
-            # plt.scatter(test_obs[env, :, :, :, :, self.start_idx + foot_idcs[env, 1] * p + 1].view(-1).cpu().numpy(),
-            #             test_obs[env, :, :, :, :, self.start_idx + foot_idcs[env, 1] * p].view(-1).cpu().numpy(), marker='x', s=marker_size)
-            plt.axis('equal')
-            plt.grid()
-            # plt.show()
-        return test_obs
+
+
+    #     # # subtract robot feet global positions from the grid
+    #     # test_obs[:, :, :, :, self.start_idx + foot_idcs[0] * p] -= \
+    #     #     self.task.foot_center_pos[0, foot_idcs[0], 0]
+    #     # test_obs[:, :, :, :, self.start_idx + foot_idcs[0] * p + 1] -= \
+    #     #     self.task.foot_center_pos[0, foot_idcs[0], 1]
+    #     # test_obs[:, :, :, :, self.start_idx + foot_idcs[1] * p] -= \
+    #     #     self.task.foot_center_pos[0, foot_idcs[1], 0]
+    #     # test_obs[:, :, :, :, self.start_idx + foot_idcs[1] * p + 1] -= \
+    #     #     self.task.foot_center_pos[0, foot_idcs[1], 1]
+
+    #     # rotate to align with robot yaw
+    #     if not NEW_THING:
+    #         yaw = self.task.base_euler[:, 2]
+    #         rot_mat = batch_z_2D_rot_mat(-yaw).view(n_env, 1, 1, 1, 1, 2, 2)
+    #         ea = ea.unsqueeze(-1)
+
+    #         for i in range(self.num_envs):
+    #             rot_mat = batch_z_2D_rot_mat(-yaw[i])
+    #             test_obs[i, :, :, :, :, self.start_idx + foot_idcs[i, 0] * p: self.start_idx + foot_idcs[i, 0] * p + p] = \
+    #                 (rot_mat @ test_obs[i, :, :, :, :, self.start_idx + foot_idcs[i, 0] * p: self.start_idx + foot_idcs[i, 0] * p + p].unsqueeze(-1)).squeeze(-1)
+    #             test_obs[i, :, :, :, :, self.start_idx + foot_idcs[i, 1] * p: self.start_idx + foot_idcs[i, 1] * p + p] = \
+    #                 (rot_mat @ test_obs[i, :, :, :, :, self.start_idx + foot_idcs[i, 1] * p: self.start_idx + foot_idcs[i, 1] * p + p].unsqueeze(-1)).squeeze(-1)
+    #     if PLOT and self.task.progress_buf[0] % PLOT_AFTER == 0:
+    #         # plot the search points in the robot frame
+    #         # global ROBO_FIG
+    #         # ROBO_FIG = plt.figure()
+    #         plt.figure("robot")
+    #         plt.title("Robot frame (x is up), first foot search points")
+    #         marker_size = 10
+    #         plt.scatter(-test_obs[env, :, :, :, :, self.start_idx + foot_idcs[env, 0] * p + 1].view(-1).cpu().numpy(),
+    #                     test_obs[env, :, :, :, :, self.start_idx + foot_idcs[env, 0] * p].view(-1).cpu().numpy(), marker='x', s=marker_size)
+    #         # plt.scatter(test_obs[env, :, :, :, :, self.start_idx + foot_idcs[env, 1] * p + 1].view(-1).cpu().numpy(),
+    #         #             test_obs[env, :, :, :, :, self.start_idx + foot_idcs[env, 1] * p].view(-1).cpu().numpy(), marker='x', s=marker_size)
+    #         plt.axis('equal')
+    #         plt.grid()
+    #         # plt.show()
+    #     return test_obs
 
     '''
     def get_optimal_targets_from_4D_old(self, values, i):
@@ -789,29 +818,29 @@ class ValueProcesser:
         return optimal_targets, max_idx
     '''
 
-    def get_optimal_targets_from_4D(self, values):
-        # initialize with current targets (to keep correct z-height)
-        optimal_targets = torch.zeros(self.num_envs, 2, 2, device=self.device)
+    # def get_optimal_targets_from_4D(self, values):
+    #     # initialize with current targets (to keep correct z-height)
+    #     optimal_targets = torch.zeros(self.num_envs, 2, 2, device=self.device)
 
-        max_idx = (values == values.amax(dim=(1, 2, 3, 4), keepdim=True)).nonzero()
-        # prev line could return multiple indices equal to the max per env, so we just select the first one
-        # the first colum of max_idx is the env idx
+    #     max_idx = (values == values.amax(dim=(1, 2, 3, 4), keepdim=True)).nonzero()
+    #     # prev line could return multiple indices equal to the max per env, so we just select the first one
+    #     # the first colum of max_idx is the env idx
 
-        # first row is always valid
-        valid_rows = torch.ones(max_idx.shape[0], device=self.device,
-                                dtype=torch.bool)
-        valid_rows[1:] = max_idx[:-1, 0] != max_idx[1:, 0]
+    #     # first row is always valid
+    #     valid_rows = torch.ones(max_idx.shape[0], device=self.device,
+    #                             dtype=torch.bool)
+    #     valid_rows[1:] = max_idx[:-1, 0] != max_idx[1:, 0]
 
-        # only take valid rows and chop off the env idx
-        max_idx = max_idx[valid_rows][:, 1:]
+    #     # only take valid rows and chop off the env idx
+    #     max_idx = max_idx[valid_rows][:, 1:]
 
-        if self.random_footsteps:
-            max_idx = torch.randint_like(max_idx, low=0, high=self.grid_points)
+    #     if self.random_footsteps:
+    #         max_idx = torch.randint_like(max_idx, low=0, high=self.grid_points)
 
-        optimal_targets = self.grid2m(max_idx).view(self.num_envs, 2, 2) \
-            + self.fg.footsteps[self.env_arange, self.fg.current_footstep - 2]
+    #     optimal_targets = self.grid2m(max_idx).view(self.num_envs, 2, 2) \
+    #         + self.fg.footsteps[self.env_arange, self.fg.current_footstep - 2]
 
-        return optimal_targets, max_idx
+    #     return optimal_targets, max_idx
 
     # def get_optimal_targets_from_8D(self, values):
     #     # initialize with current targets (to keep correct z-height)
@@ -845,103 +874,103 @@ class ValueProcesser:
         """
         return (idx / (self.grid_points - 1.0) - 0.5) * 2 * self.box_len * grid_dialation
 
-    def plot_4D_values(self, values, max_idx):
-        if self.normalize_heatmap_scale:
-            # if this is the first call to search 4D set,
-            # set min and max
-            # min_pixel = values.min()
-            # max_pixel = values.max()
-            # if max_pixel > self.max_pixel:
-            #     self.max_pixel = max_pixel
-            # if min_pixel < self.min_pixel:
-            #     self.min_pixel = min_pixel
-            if (self.task.progress_buf[0] == self.start_after_n_steps
-                    or self.task.progress_buf[0] == 1):
-                min_pixel = values.min()
-                max_pixel = values.max()
-                margin = (max_pixel - min_pixel) * 1.0
-                if self.max_pixel is None:
-                    self.max_pixel = max_pixel + margin
-                if self.min_pixel is None:
-                    self.min_pixel = min_pixel
-            vmin = self.min_pixel
-            vmax = self.max_pixel
-        else:
-            vmin = None
-            vmax = None
+    # def plot_4D_values(self, values, max_idx):
+    #     if self.normalize_heatmap_scale:
+    #         # if this is the first call to search 4D set,
+    #         # set min and max
+    #         # min_pixel = values.min()
+    #         # max_pixel = values.max()
+    #         # if max_pixel > self.max_pixel:
+    #         #     self.max_pixel = max_pixel
+    #         # if min_pixel < self.min_pixel:
+    #         #     self.min_pixel = min_pixel
+    #         if (self.task.progress_buf[0] == self.start_after_n_steps
+    #                 or self.task.progress_buf[0] == 1):
+    #             min_pixel = values.min()
+    #             max_pixel = values.max()
+    #             margin = (max_pixel - min_pixel) * 1.0
+    #             if self.max_pixel is None:
+    #                 self.max_pixel = max_pixel + margin
+    #             if self.min_pixel is None:
+    #                 self.min_pixel = min_pixel
+    #         vmin = self.min_pixel
+    #         vmax = self.max_pixel
+    #     else:
+    #         vmin = None
+    #         vmax = None
 
-        foot_idcs = self.fg.get_footstep_idcs(self.fg.current_footstep)[0]
-        skip = self.grid_points // (self.num_plot_rows - 1)
-        values[max(0, max_idx[0] - skip // 2): max_idx[0] + skip // 2,
-               max(0, max_idx[1] - skip // 2): max_idx[1] + skip // 2,
-               max(0, max_idx[2] - 1): max_idx[2] + 2,
-               max(0, max_idx[3] - 1): max_idx[3] + 2] = float('nan')
-        _values = values.cpu().numpy()
-        plt.figure(num=2, figsize=[12.6, 10.8])
-        plt.suptitle(f"Value plots for {self.foot_names[foot_idcs[1]]} "
-                     f"footstep targets in [{-self.box_len}, {self.box_len}] box",
-                     fontsize=16)
-        for i in range(0, self.grid_points, skip):
-            for j in range(0, self.grid_points, skip):
-                plt.subplot(self.num_plot_rows,
-                            self.num_plot_rows,
-                            i//skip * self.num_plot_rows + j//skip + 1)
-                # I need to switch x and y to align with the robot and
-                # reverse both axes
-                x_idx = self.grid_points - i - 1
-                y_idx = self.grid_points - j - 1
-                cmap = plt.cm.get_cmap("viridis").copy()
-                cmap.set_bad((1, 0, 0, 1))
-                plt.imshow(np.flip(_values[x_idx, y_idx], (0, 1)),
-                           cmap=cmap, interpolation='nearest', vmin=vmin,
-                           vmax=vmax)
-                tick_locations = torch.arange(
-                    0, self.grid_points + 1, self.grid_points // 4).numpy()
-                plt.axis('off')
-                num_ticks = len(tick_locations)
-                # plt.xticks(tick_locations, np.around(torch.linspace(-self.box_len, self.box_len, num_ticks).numpy(), decimals=2))
-                # plt.yticks(tick_locations, np.around(torch.linspace(self.box_len, -self.box_len, num_ticks).numpy(), decimals=2))
+    #     foot_idcs = self.fg.get_footstep_idcs(self.fg.current_footstep)[0]
+    #     skip = self.grid_points // (self.num_plot_rows - 1)
+    #     values[max(0, max_idx[0] - skip // 2): max_idx[0] + skip // 2,
+    #            max(0, max_idx[1] - skip // 2): max_idx[1] + skip // 2,
+    #            max(0, max_idx[2] - 1): max_idx[2] + 2,
+    #            max(0, max_idx[3] - 1): max_idx[3] + 2] = float('nan')
+    #     _values = values.cpu().numpy()
+    #     plt.figure(num=2, figsize=[12.6, 10.8])
+    #     plt.suptitle(f"Value plots for {self.foot_names[foot_idcs[1]]} "
+    #                  f"footstep targets in [{-self.box_len}, {self.box_len}] box",
+    #                  fontsize=16)
+    #     for i in range(0, self.grid_points, skip):
+    #         for j in range(0, self.grid_points, skip):
+    #             plt.subplot(self.num_plot_rows,
+    #                         self.num_plot_rows,
+    #                         i//skip * self.num_plot_rows + j//skip + 1)
+    #             # I need to switch x and y to align with the robot and
+    #             # reverse both axes
+    #             x_idx = self.grid_points - i - 1
+    #             y_idx = self.grid_points - j - 1
+    #             cmap = plt.cm.get_cmap("viridis").copy()
+    #             cmap.set_bad((1, 0, 0, 1))
+    #             plt.imshow(np.flip(_values[x_idx, y_idx], (0, 1)),
+    #                        cmap=cmap, interpolation='nearest', vmin=vmin,
+    #                        vmax=vmax)
+    #             tick_locations = torch.arange(
+    #                 0, self.grid_points + 1, self.grid_points // 4).numpy()
+    #             plt.axis('off')
+    #             num_ticks = len(tick_locations)
+    #             # plt.xticks(tick_locations, np.around(torch.linspace(-self.box_len, self.box_len, num_ticks).numpy(), decimals=2))
+    #             # plt.yticks(tick_locations, np.around(torch.linspace(self.box_len, -self.box_len, num_ticks).numpy(), decimals=2))
 
-                plt.title(
-                    f"{self.foot_names[foot_idcs[0]]}: "
-                    f"({self.grid2m(x_idx): 0.2f},"
-                    f"{self.grid2m(y_idx): 0.2f})",
-                    fontsize=10)
-                plt.colorbar()
-                plt.grid()
+    #             plt.title(
+    #                 f"{self.foot_names[foot_idcs[0]]}: "
+    #                 f"({self.grid2m(x_idx): 0.2f},"
+    #                 f"{self.grid2m(y_idx): 0.2f})",
+    #                 fontsize=10)
+    #             plt.colorbar()
+    #             plt.grid()
 
-        if self.make_plots:
-            plt.show()
-        if self.save_video_frames:
-            plt.savefig(f'test_imgs/{self.file_prefix}-{self.task.progress_buf[0]}.png')
+    #     if self.make_plots:
+    #         plt.show()
+    #     if self.save_video_frames:
+    #         plt.savefig(f'test_imgs/{self.file_prefix}-{self.task.progress_buf[0]}.png')
 
 
-    def adjust_4D_values(self, values):
-        """Adds other optimzation terms (direction) to 4D values.
+    # def adjust_4D_values(self, values):
+    #     """Adds other optimzation terms (direction) to 4D values.
 
-        dim 0: foot 0  x
-        dim 1: foot 0  y
-        dim 2: foot 1  x
-        dim 3: foot 1  y
-        """
-        # self.des_dir = torch.tensor(
-        #     [self.pi * (self.task.progress_buf[0] % 4) / 2.0
-        #      + self.pi / 4.0],
-        #     device=self.device)
-        # values = torch.zeros([self.grid_points] * 4, device=self.device)
-        # values = torch.rand([self.grid_points] * 4, device=self.device)
+    #     dim 0: foot 0  x
+    #     dim 1: foot 0  y
+    #     dim 2: foot 1  x
+    #     dim 3: foot 1  y
+    #     """
+    #     # self.des_dir = torch.tensor(
+    #     #     [self.pi * (self.task.progress_buf[0] % 4) / 2.0
+    #     #      + self.pi / 4.0],
+    #     #     device=self.device)
+    #     # values = torch.zeros([self.grid_points] * 4, device=self.device)
+    #     # values = torch.rand([self.grid_points] * 4, device=self.device)
 
-        # add directional coefficients
-        # mean_var = values.var() + 0.1
-        x_coef = self.des_dir.cos() * self.des_dir_weight  # * mean_var
-        y_coef = self.des_dir.sin() * self.des_dir_weight  # * mean_var
+    #     # add directional coefficients
+    #     # mean_var = values.var() + 0.1
+    #     x_coef = self.des_dir.cos() * self.des_dir_weight  # * mean_var
+    #     y_coef = self.des_dir.sin() * self.des_dir_weight  # * mean_var
 
-        values[...] += self.grid.view(1, self.grid_points, 1, 1, 1) * x_coef
-        values[...] += self.grid.view(1, 1, self.grid_points, 1, 1) * y_coef
-        values[...] += self.grid.view(1, 1, 1, self.grid_points, 1) * x_coef
-        values[...] += self.grid.view(1, 1, 1, 1, self.grid_points) * y_coef
+    #     values[...] += self.grid.view(1, self.grid_points, 1, 1, 1) * x_coef
+    #     values[...] += self.grid.view(1, 1, self.grid_points, 1, 1) * y_coef
+    #     values[...] += self.grid.view(1, 1, 1, self.grid_points, 1) * x_coef
+    #     values[...] += self.grid.view(1, 1, 1, 1, self.grid_points) * y_coef
 
-        return values
+    #     return values
 
     # def adjust_8D_values(self, values):
     #     # TODO
@@ -1052,3 +1081,21 @@ class MyIterator:
             return output
         else:
             raise StopIteration
+
+def save_fig(values, min_val, max_val, path, n, grid, name):
+    plt.figure()
+    plt.imshow(values, interpolation='nearest', vmin=min_val, vmax=max_val)
+    # add a colorbar
+    plt.colorbar()
+    plt.xlabel("x-Distance from Last Target (m)")
+    plt.ylabel("y-Distance from Last Target (m)")
+    plt.xticks(np.arange(0, n, step=n // 5),
+                    [f"{val:.2f}" for val in grid[::n // 5]])
+    plt.yticks(np.arange(0, n, step=n // 5),
+                    [f"{val:.2f}" for val in grid[::n // 5]])
+    plt.title(f"{name} Footstep Target Value Surface")
+    # tight layout
+    # self.threadpool.submit(self.save_fig, plt.gcf(), os.path.join(self.task.img_dir, f"{foot_names[plot_foot_idcs[i]]}-frame-{self.task.progress_buf[0]:04}.png"))
+    plt.tight_layout()
+    plt.savefig(path)
+    plt.close()
