@@ -8,13 +8,10 @@ import sys
 
 from tasks.aliengo_utils.utils import batch_z_2D_rot_mat
 
-PLOT = False
-NEW_THING = False
-PLOT_AFTER = 100
 
 class ValueProcesser:
     def __init__(self, player, des_dir=0.0, des_dir_coef=0.0,
-                 start_after_n_steps=60, file_prefix="value_search", box_len=0.25,
+                 start_after_n_steps=60, file_prefix="value_search", box_len=0.15,
                  grid_points=5, random_footsteps=False):
         """
         Update: This code is now vectorized across environments. The first
@@ -84,20 +81,29 @@ class ValueProcesser:
 
         self.obs_len = obs.shape[1]
 
-        if self.task.args.save_images:
-            self.generate_plot_frames(obs)
         if self.task.progress_buf[0] >= self.start_after_n_steps:
             # self.make_2D_value_plot(obs)
-            return self.gd_8D(obs)
+            output_obs = self.gd_8D(obs)
+            if self.task.args.save_images:
+                self.generate_plot_frames(obs, output_obs.clone())
+            return output_obs
+        elif self.task.args.save_images:
+            self.generate_plot_frames(obs, None)
+            return obs
         else:
             return obs
 
-    def generate_plot_frames(self, obs):
+    def generate_plot_frames(self, obs, optim_obs):
         # do one 2d grid at a time
         env = 0
-        n = 100
-        grid = torch.linspace(-self.box_len, self.box_len,
-                               n, device=self.device)
+        n = 50
+        expansion_for_plotting = 3.5
+        grid = torch.linspace(
+            -self.box_len * expansion_for_plotting,
+            self.box_len * expansion_for_plotting,
+            n,
+            device=self.device
+            )
         orig_obs = obs[env].clone()
         orig_footstep_obs = orig_obs[self.start_idx:self.start_idx + 12]
         foot_idcs = self.fg.get_footstep_idcs(self.fg.current_footstep)[env]
@@ -186,14 +192,56 @@ class ValueProcesser:
             plot_foot_idcs = [0, 3, 1, 2]
 
         # normalize all values by same color scale
-        max_val = values.max()
-        min_val = values.min()
+        # max_val = values.max()
+        # min_val = values.min()
+        new_obs = new_obs.view(4, n, n, new_obs.shape[1])
+        if optim_obs is not None:
+            optim_obs = optim_obs[env]
+            params = optim_obs[self.start_idx:self.start_idx + 12]
+            curr_foot_idcs = self.fg.get_footstep_idcs(self.fg.current_footstep)[env]
+            # get the indices of new_obs where the optimal targets are closest
+            if curr_foot_idcs[0] == 0:
+                fl = params[:2]
+                fl_idx = (new_obs[0, :, :, self.start_idx:self.start_idx + 2] - fl).norm(dim=-1).argmin().cpu().item()
+                rr = params[6:8]
+                rr_idx = (new_obs[1, :, :, self.start_idx + 6:self.start_idx + 8] - rr).norm(dim=-1).argmin().cpu().item()
+                fr = params[8:10]
+                fr_idx = (new_obs[2, :, :, self.start_idx + 8:self.start_idx + 10] - fr).norm(dim=-1).argmin().cpu().item()
+                rl = params[10:12]
+                rl_idx = (new_obs[3, :, :, self.start_idx + 10:self.start_idx + 12] - rl).norm(dim=-1).argmin().cpu().item()
+            else:
+                fl = params[8:10]
+                fl_idx = (new_obs[2, :, :, self.start_idx + 8:self.start_idx + 10] - fl).norm(dim=-1).argmin().cpu().item()
+                rr = params[10:12]
+                rr_idx = (new_obs[3, :, :, self.start_idx + 10:self.start_idx + 12] - rr).norm(dim=-1).argmin().cpu().item()
+                fr = params[2:4]
+                fr_idx = (new_obs[0, :, :, self.start_idx + 2:self.start_idx + 4] - fr).norm(dim=-1).argmin().cpu().item()
+                rl = params[4:6]
+                rl_idx = (new_obs[1, :, :, self.start_idx + 4:self.start_idx + 6] - rl).norm(dim=-1).argmin().cpu().item()
+            target_idcs = (
+                (fl_idx // n, fl_idx % n),
+                (fr_idx // n, fr_idx % n),
+                (rl_idx // n, rl_idx % n),
+                (rr_idx // n, rr_idx % n),
+            )
+            for pp in range(4):
+                for qq in range(2):
+                    if target_idcs[pp][qq] > n or target_idcs[pp][qq] < 0:
+                        print("Target index out of bounds")
+                        breakpoint()
+
+        else:
+            target_idcs = (None, None, None, None)
+
+        max_val = 420
+        min_val = 240
+        # max_val = None
+        # min_val = None
         grid = grid.cpu().numpy()
         for i in range(4):
             path = os.path.join(self.task.img_dir, f"{foot_names[plot_foot_idcs[i]]}-frame-{self.task.progress_buf[0]:04}.png")
-            self.pool.submit(save_fig, values[i], min_val, max_val, path, n, grid, foot_names[plot_foot_idcs[i]])
-            # self.futures.append(temp)
-            # save_fig(values[i], min_val, max_val, path, n, grid, foot_names[plot_foot_idcs[i]])
+            self.pool.submit(save_fig, values[i], min_val, max_val, path, n, grid, foot_names[plot_foot_idcs[i]], target_idcs[plot_foot_idcs[i]])
+            # save_fig(values[i], min_val, max_val, path, n, grid, foot_names[plot_foot_idcs[i]], target_idcs[i])
 
     def make_2D_value_plot(self, obs):
         """
@@ -343,10 +391,11 @@ class ValueProcesser:
             future_opt_tgt_foot1 = (rot_mats @ self.params[:, 6:8].view(self.num_envs, 2, 1)).squeeze(-1) + self.task.foot_center_pos[self.env_arange, fut_footstep_idcs[:, 1], :2]
 
         # assign back to footstep targets
-        self.fg.footsteps[self.env_arange, self.fg.current_footstep, 0] = curr_opt_tgt_foot0
-        self.fg.footsteps[self.env_arange, self.fg.current_footstep, 1] = curr_opt_tgt_foot1
-        self.fg.footsteps[self.env_arange, self.fg.current_footstep + 1, 0] = future_opt_tgt_foot0
-        self.fg.footsteps[self.env_arange, self.fg.current_footstep + 1, 1] = future_opt_tgt_foot1
+        if (self.fg.current_footstep >= 2).all(): # optimization code does not work otherwise
+            self.fg.footsteps[self.env_arange, self.fg.current_footstep, 0] = curr_opt_tgt_foot0
+            self.fg.footsteps[self.env_arange, self.fg.current_footstep, 1] = curr_opt_tgt_foot1
+            self.fg.footsteps[self.env_arange, self.fg.current_footstep + 1, 0] = future_opt_tgt_foot0
+            self.fg.footsteps[self.env_arange, self.fg.current_footstep + 1, 1] = future_opt_tgt_foot1
 
         self.fg.plot_footstep_targets(current_only=True)
         if self.optmize_current_step:
@@ -1012,6 +1061,10 @@ class ValueProcesser:
             res_dict = self.player.model(input_dict)
         raw_values = res_dict["values"]
         values = self.player.value_mean_std(raw_values, unnorm=True)
+        if (self.fg.current_footstep < 2).any():
+            fake_return = torch.zeros_like(values)
+            fake_return.requires_grad = True
+            return fake_return
         directional_term = torch.zeros_like(values)
         batch_obs = batch_obs.view(self.num_envs, -1, self.obs_len)
         if self.des_dir_weight > 0.0:
@@ -1082,18 +1135,28 @@ class MyIterator:
         else:
             raise StopIteration
 
-def save_fig(values, min_val, max_val, path, n, grid, name):
-    plt.figure()
+def save_fig(values, min_val, max_val, path, n, grid, name, target_idcs):
+    plt.figure(figsize=(4.0, 4.0))
+    # plt.imshow(np.flip(values, axis=(0,1)), interpolation='nearest', vmin=min_val, vmax=max_val)
+    if target_idcs is not None: # red star
+
+        plt.scatter(target_idcs[1], target_idcs[0], marker='*', color='r')
+        # plt.scatter([0], [0], marker='*', color='r')
+        # plt.scatter([n], [0], marker='*', color='k')
     plt.imshow(values, interpolation='nearest', vmin=min_val, vmax=max_val)
+    margin = 0
+    plt.xlim(-margin, n + margin)
+    plt.ylim(-margin, n + margin)
+    # axis equal
     # add a colorbar
     plt.colorbar()
-    plt.xlabel("x-Distance from Last Target (m)")
-    plt.ylabel("y-Distance from Last Target (m)")
+    plt.xlabel("y-Distance from Last Target (m)")
+    plt.ylabel("x-Distance from Last Target (m)")
     plt.xticks(np.arange(0, n, step=n // 5),
                     [f"{val:.2f}" for val in grid[::n // 5]])
     plt.yticks(np.arange(0, n, step=n // 5),
                     [f"{val:.2f}" for val in grid[::n // 5]])
-    plt.title(f"{name} Footstep Target Value Surface")
+    plt.title(f"{name} Footstep Target Learned Values")
     # tight layout
     # self.threadpool.submit(self.save_fig, plt.gcf(), os.path.join(self.task.img_dir, f"{foot_names[plot_foot_idcs[i]]}-frame-{self.task.progress_buf[0]:04}.png"))
     plt.tight_layout()
