@@ -1136,7 +1136,7 @@ class MyIterator:
             raise StopIteration
 
 def save_fig(values, min_val, max_val, path, n, grid, name, target_idcs):
-    plt.figure(figsize=(4.0, 4.0))
+    plt.figure(figsize=(3.5, 3.5))
     # plt.imshow(np.flip(values, axis=(0,1)), interpolation='nearest', vmin=min_val, vmax=max_val)
     if target_idcs is not None: # red star
 
@@ -1149,7 +1149,7 @@ def save_fig(values, min_val, max_val, path, n, grid, name, target_idcs):
     plt.ylim(-margin, n + margin)
     # axis equal
     # add a colorbar
-    plt.colorbar()
+    # plt.colorbar()
     plt.xlabel("y-Distance from Last Target (m)")
     plt.ylabel("x-Distance from Last Target (m)")
     plt.xticks(np.arange(0, n, step=n // 5),
